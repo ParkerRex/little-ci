@@ -1,0 +1,28 @@
+# Optional scheduled disk-hygiene workflow for self-hosted runners.
+# Complements the on-box reaper in provision-box.sh by reclaiming Docker build
+# cache, package caches, and old runner _diag logs when a runner's disk crosses
+# a threshold. Copy into your repo's .github/workflows/ and adjust the label.
+name: ci-runner-disk-hygiene
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 min
+  workflow_dispatch: {}
+jobs:
+  clean:
+    runs-on: [self-hosted]   # or a specific runner label, e.g. [self-hosted, ci-1]
+    steps:
+      - name: Reclaim disk if above threshold
+        shell: bash
+        run: |
+          THRESHOLD=88
+          used=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+          echo "disk used: ${used}% (threshold ${THRESHOLD}%)"
+          if [ "$used" -ge "$THRESHOLD" ]; then
+            echo "above threshold — reclaiming"
+            docker system prune -af --volumes || true
+            npm cache clean --force 2>/dev/null || true
+            find "$HOME"/actions-runner*/_diag -type f -mtime +1 -delete 2>/dev/null || true
+            df -h /
+          else
+            echo "below threshold — nothing to do"
+          fi

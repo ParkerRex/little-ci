@@ -1,0 +1,11 @@
+# local config (keep your repo URL / choices out of git)
+config.env
+
+# runner distribution + registered runner state — NEVER commit these
+actions-runner*/
+*.tar.gz
+.runner
+.credentials
+.credentials_rsaparams
+_work/
+_diag/
