@@ -1,0 +1,56 @@
+# Example: share ONE native Postgres across all CI runs, but give each run its own
+# isolated SCHEMA so runs never collide — sequential or concurrent. Pairs with
+# provision-postgres.sh (which creates the role+db this assumes: ci/ci on :5432).
+# Generalize the app-specific bits (npm ci / npm test) to your stack.
+name: test
+on: [push, pull_request]
+
+concurrency:
+  # Optional: bound how many test jobs hit the shared box at once. Per-run schemas
+  # already make parallel runs safe; this is about RAM/load, not DB collisions.
+  group: ci-postgres-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: [self-hosted]
+    env:
+      PGHOST: 127.0.0.1        # 127.0.0.1, not localhost — dodges ::1-vs-IPv4 flakiness
+      PGPORT: "5432"
+      PGUSER: ci
+      PGPASSWORD: ci           # local-only CI credential; the box must not expose 5432
+      PGDATABASE: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision isolated per-run schema (+ wait for Postgres)
+        run: |
+          set -euo pipefail
+          # Fail fast if Postgres is down/hung rather than hanging the job.
+          for i in $(seq 1 30); do
+            pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" && break
+            [ "$i" = 30 ] && { echo "Postgres not ready after 30s"; exit 1; }
+            sleep 1
+          done
+          SCHEMA="run_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          BASE="postgresql://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE"
+          psql "$BASE?connect_timeout=5" -v ON_ERROR_STOP=1 \
+            -c "CREATE SCHEMA IF NOT EXISTS \"$SCHEMA\";"
+          # Point the app at THIS run's schema via search_path in the URL.
+          URL="$BASE?options=-csearch_path%3D$SCHEMA&connect_timeout=5"
+          {
+            echo "DATABASE_URL=$URL"
+            echo "TEST_DATABASE_URL=$URL"
+            echo "RUN_SCHEMA=$SCHEMA"
+          } >> "$GITHUB_ENV"
+
+      - name: Test
+        run: |
+          npm ci
+          npm test
+
+      - name: Drop the per-run schema
+        if: always()   # so a crashed run can't leave schemas piling up in the shared DB
+        run: |
+          psql "postgresql://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE?connect_timeout=5" \
+            -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS \"$RUN_SCHEMA\" CASCADE;" || true

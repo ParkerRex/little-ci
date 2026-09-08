@@ -9,6 +9,7 @@ It's three short, idempotent scripts plus a config file:
 |---|---|
 | `provision-box.sh` | Host prep: per-runner swap, low swappiness, per-runner `/scratch`, and a `/tmp`+scratch reaper. |
 | `install-runners.sh` | Downloads the runner, registers N runners against your repo/org, installs them as systemd services. |
+| `provision-postgres.sh` | Optional: one small native Postgres for CI to share, with per-run schema isolation. |
 | `check-runners.sh` | Health check — how many runners are online vs expected. GREEN / RED / DARK. |
 
 Everything is parameterized through `config.env` — set your repo, runner count,
@@ -112,6 +113,9 @@ export REGTOKEN="$(gh api -X POST repos/OWNER/REPO/actions/runners/registration-
 # 3. Install + register + start the runners. Run as your RUNNER_USER (e.g. deploy):
 ./install-runners.sh
 
+# 3b. (Optional) if your tests need Postgres — one small shared instance:
+sudo ./provision-postgres.sh
+
 # 4. Verify (from anywhere with gh access to the repo/org):
 ./check-runners.sh
 ```
@@ -136,6 +140,27 @@ any workflow with `runs-on: [self-hosted]` (or your custom label).
   `/scratch/N` at `REAP_AGE` (default 6h) using the stock `systemd-tmpfiles-clean.timer`.
   Dead job-workspace dirs are the usual cause of a slow creep to
   "No space left on device"; this sweeps them.
+
+## The test database (optional): one small Postgres, per-run schemas
+
+If your suite needs Postgres, the naive setup — one shared instance every job writes
+into — means parallel runs clobber each other's data and exhaust connections. The
+other extreme, a fresh Postgres container per job, is heavier and slower than it needs
+to be.
+
+What's here instead:
+
+- **`provision-postgres.sh`** installs **one small native Postgres** on the box
+  (default `shared_buffers=128MB` — deliberately tiny) with a role that owns a single
+  database. All runners share it.
+- **Each run gets its own schema.** `examples/ci-per-run-schema.yml` shows the pattern:
+  a run creates `run_<id>_<attempt>`, points `search_path` at it via `DATABASE_URL`,
+  and drops it in an `if: always()` cleanup step so a crashed run can't leave schemas
+  piling up. Because the role owns the database, `CREATE SCHEMA` needs no extra grants,
+  and per-run schemas make concurrent runs safe without a container per job.
+
+Tune it in `config.env` (`PG_USER`, `PG_DB`, `PG_SHARED_BUFFERS`, `PG_MAX_CONNECTIONS`).
+Keep it small: on a constrained box, a lean shared instance beats N heavy ones.
 
 ## Configuration
 
@@ -165,6 +190,9 @@ your repo's `.github/workflows/`.
   the runner's live auth. `.gitignore` already excludes them, the runner tarball, and
   `_work` / `_diag`.
 - Give the runner user only what it needs; keep the box single-purpose.
+- **The Postgres `PG_PASSWORD` is a local-only CI credential**, not a secret to guard —
+  but only because the box keeps Postgres bound to `localhost` and never exposes `5432`.
+  Keep it that way; a self-hosted CI DB should not be reachable from the internet.
 
 ## License
 
