@@ -127,7 +127,11 @@ for ((runner_number = 1; runner_number <= RUNNER_COUNT; runner_number++)); do
     runner_prefix="$3"
     runner_number="$4"
     cd "$runner_dir"
-    if [ ! -f .service ]; then
+    [ ! -L .service ] || {
+      echo "runner service metadata must not be a symlink: $runner_dir/.service" >&2
+      exit 1
+    }
+    if [ ! -e .service ]; then
       ./svc.sh install "$runner_user"
     fi
     [ -f .service ] || {
@@ -140,6 +144,25 @@ for ((runner_number = 1; runner_number <= RUNNER_COUNT; runner_number++)); do
       exit 1
     }
     service_unit_file="/etc/systemd/system/$runner_service_name"
+    if ! test -f "$service_unit_file"; then
+      if systemctl is-active --quiet "$runner_service_name"; then
+        echo "runner service $runner_service_name is active but its unit file is missing" >&2
+        echo "drain and stop the service before rerunning install-runners-orb.sh" >&2
+        exit 1
+      fi
+      rm -f -- .service
+      ./svc.sh install "$runner_user"
+      [ -f .service ] && [ ! -L .service ] || {
+        echo "runner service reinstall did not create regular metadata: $runner_dir/.service" >&2
+        exit 1
+      }
+      runner_service_name="$(cat .service)"
+      [[ "$runner_service_name" =~ ^actions\.runner\.[A-Za-z0-9_.@-]+\.service$ ]] || {
+        echo "reinstalled runner service metadata contains an invalid unit name: $runner_dir/.service" >&2
+        exit 1
+      }
+      service_unit_file="/etc/systemd/system/$runner_service_name"
+    fi
     test -f "$service_unit_file" && \
       grep -Fqx -- "ExecStart=$runner_dir/runsvc.sh" "$service_unit_file" && \
       grep -Fqx -- "User=$runner_user" "$service_unit_file" && \

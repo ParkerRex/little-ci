@@ -5,6 +5,12 @@ set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 failures=0
 warnings=0
+diagnostic_payload_dir=""
+
+cleanup_diagnostic_payloads() {
+  [ -z "$diagnostic_payload_dir" ] || rm -rf -- "$diagnostic_payload_dir"
+}
+trap cleanup_diagnostic_payloads EXIT
 
 pass() { printf 'PASS: %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*"; warnings=$((warnings + 1)); }
@@ -247,13 +253,27 @@ if len(matches) == 1:
 ' "$RUNNER_GROUP" 2>/dev/null || true)"
   if [ -z "$runner_group_id" ]; then
     fail "organization runner group '$RUNNER_GROUP' is missing, ambiguous, or inaccessible"
+  elif ! command -v mktemp >/dev/null 2>&1; then
+    fail "mktemp is required to verify organization runner-group membership"
+  elif ! diagnostic_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/little-ci-doctor.XXXXXX")"; then
+    fail "could not create protected storage for organization runner-group diagnostics"
   else
+    chmod 700 "$diagnostic_payload_dir"
+    all_runners_path="$diagnostic_payload_dir/all-runners.json"
+    group_runners_path="$diagnostic_payload_dir/group-runners.json"
     group_runners_json="$(gh api --paginate --slurp "/orgs/${GITHUB_TARGET}/actions/runner-groups/${runner_group_id}/runners?per_page=100" 2>/dev/null || true)"
-    group_report="$(python3 -c '
+    if ! printf '%s' "$api_pages_json" > "$all_runners_path" || \
+      ! printf '%s' "$group_runners_json" > "$group_runners_path"; then
+      fail "could not stage organization runner-group diagnostics"
+      group_report=""
+    else
+      group_report="$(python3 -c '
 import json, sys
 prefix, count = sys.argv[1], int(sys.argv[2])
-all_pages = json.loads(sys.argv[3])
-group_pages = json.loads(sys.argv[4])
+with open(sys.argv[3], encoding="utf-8") as stream:
+    all_pages = json.load(stream)
+with open(sys.argv[4], encoding="utf-8") as stream:
+    group_pages = json.load(stream)
 all_by_name = {runner.get("name"): runner for page in all_pages for runner in page.get("runners", [])}
 group_by_name = {runner.get("name"): runner for page in group_pages for runner in page.get("runners", [])}
 for index in range(1, count + 1):
@@ -264,7 +284,8 @@ for index in range(1, count + 1):
         print("PASS\t%s belongs to the configured organization runner group" % name)
     else:
         print("FAIL\t%s is not a member of the configured organization runner group" % name)
-' "$RUNNER_NAME_PREFIX" "$RUNNER_COUNT" "$api_pages_json" "$group_runners_json" 2>/dev/null || true)"
+' "$RUNNER_NAME_PREFIX" "$RUNNER_COUNT" "$all_runners_path" "$group_runners_path" 2>/dev/null || true)"
+    fi
     if [ -z "$group_report" ]; then
       fail "organization runner group membership is unreadable"
     else

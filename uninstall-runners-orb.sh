@@ -4,8 +4,14 @@ set -euo pipefail
 set +x
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-for required_library in github-target.sh orbstack-machine.sh; do
-  [ -f "$script_dir/lib/$required_library" ] || { echo "missing $script_dir/lib/$required_library" >&2; exit 1; }
+for required_script in \
+  "$script_dir/lib/github-target.sh" \
+  "$script_dir/lib/orbstack-machine.sh" \
+  "$script_dir/uninstall-runners.sh"; do
+  [ -f "$required_script" ] && [ ! -L "$required_script" ] && [ -r "$required_script" ] || {
+    echo "required teardown script is missing, unreadable, or symlinked: $required_script" >&2
+    exit 1
+  }
 done
 . "$script_dir/lib/github-target.sh"
 . "$script_dir/lib/orbstack-machine.sh"
@@ -105,9 +111,28 @@ if [ "$removal_mode" = runner ]; then
 fi
 
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || { echo "uninstall-runners-orb.sh requires an Apple Silicon Mac" >&2; exit 1; }
-for required_command in orbctl gh python3; do
+for required_command in orbctl gh python3 mktemp; do
   command -v "$required_command" >/dev/null 2>&1 || { echo "$required_command is not on PATH" >&2; exit 1; }
 done
+
+guest_teardown_script="$(mktemp "${TMPDIR:-/tmp}/little-ci-uninstall.XXXXXX")"
+cleanup_guest_teardown_script() {
+  unset REMOVETOKEN 2>/dev/null || true
+  rm -f -- "$guest_teardown_script"
+}
+trap cleanup_guest_teardown_script EXIT
+trap 'exit 130' HUP INT TERM
+chmod 600 "$guest_teardown_script"
+if ! {
+  cat "$script_dir/lib/github-target.sh" &&
+  printf '\n' &&
+  cat "$script_dir/uninstall-runners.sh"
+} > "$guest_teardown_script"; then
+  echo "could not assemble the guest teardown script" >&2
+  exit 1
+fi
+bash -n "$guest_teardown_script" || { echo "assembled guest teardown script is invalid" >&2; exit 1; }
+
 orbctl list -q | grep -Fqx "$ORB_MACHINE" || { echo "OrbStack machine not found: $ORB_MACHINE" >&2; exit 1; }
 
 orbstack_validate_machine 0 || { echo "refusing teardown of an incompatible OrbStack machine" >&2; exit 1; }
@@ -137,17 +162,15 @@ if ! REMOVETOKEN="$(gh api --method POST "${GITHUB_API_TARGET}/actions/runners/r
 fi
 : "${REMOVETOKEN:?GitHub returned an empty runner remove token}"
 export REMOVETOKEN GITHUB_SCOPE GITHUB_URL RUNNER_COUNT RUNNER_NAME_PREFIX RUNNER_USER RUNNER_HOME RUNNER_GROUP
-trap 'unset REMOVETOKEN' EXIT
 
 echo "== unregistering selected local runners =="
 local_removal_succeeded=true
 if ! ORBENV=REMOVETOKEN:GITHUB_SCOPE:GITHUB_URL:RUNNER_COUNT:RUNNER_NAME_PREFIX:RUNNER_USER:RUNNER_HOME:RUNNER_GROUP \
   orbctl run -m "$ORB_MACHINE" -u root bash -s -- "${forwarded_args[@]}" \
-  < <(cat "$script_dir/lib/github-target.sh" "$script_dir/uninstall-runners.sh"); then
+  < "$guest_teardown_script"; then
   local_removal_succeeded=false
 fi
 unset REMOVETOKEN
-trap - EXIT
 
 report_remaining_state() {
   local recovery_args="--$removal_mode"

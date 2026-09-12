@@ -63,6 +63,70 @@ record_created_swapfile() {
     printf '%s\n' "$ownership_record" >> "$swap_ownership_manifest"
 }
 
+swapfile_is_manifest_owned() {
+  local runner_number="$1" swapfile_path="$2" ownership_record manifest_dir manifest_metadata
+  manifest_dir="$(dirname "$swap_ownership_manifest")"
+  ownership_record="$(printf '%s\t%s' "$runner_number" "$swapfile_path")"
+
+  [ ! -L "$manifest_dir" ] && [ ! -L "$swap_ownership_manifest" ] || return 1
+  [ -d "$manifest_dir" ] && [ -f "$swap_ownership_manifest" ] || return 1
+  manifest_metadata="$(stat -c '%u:%g:%a' "$manifest_dir")"
+  [ "$manifest_metadata" = 0:0:700 ] || return 1
+  manifest_metadata="$(stat -c '%u:%g:%a' "$swap_ownership_manifest")"
+  [ "$manifest_metadata" = 0:0:600 ] || return 1
+  grep -Fqx "$ownership_record" "$swap_ownership_manifest"
+}
+
+validate_owned_swapfile() {
+  local runner_number="$1" swapfile_path="$2" expected_size_bytes actual_metadata
+  local actual_size_bytes filesystem_signature
+
+  swapfile_is_manifest_owned "$runner_number" "$swapfile_path" || {
+    echo "refusing existing unowned Little-CI swapfile: $swapfile_path" >&2
+    return 1
+  }
+  [ -f "$swapfile_path" ] && [ ! -L "$swapfile_path" ] || {
+    echo "owned swapfile must be a regular, non-symlink file: $swapfile_path" >&2
+    return 1
+  }
+  actual_metadata="$(stat -c '%u:%g:%a' "$swapfile_path")"
+  [ "$actual_metadata" = 0:0:600 ] || {
+    echo "owned swapfile must be root-owned mode 600: $swapfile_path" >&2
+    return 1
+  }
+  expected_size_bytes="$((SWAP_GB * 1024 * 1024 * 1024))"
+  actual_size_bytes="$(stat -c '%s' "$swapfile_path")"
+  [ "$actual_size_bytes" = "$expected_size_bytes" ] || {
+    echo "owned swapfile has size ${actual_size_bytes}B; expected ${expected_size_bytes}B: $swapfile_path" >&2
+    return 1
+  }
+  filesystem_signature="$(blkid -p -s TYPE -o value "$swapfile_path" 2>/dev/null)" || {
+    echo "owned swapfile has no readable swap signature: $swapfile_path" >&2
+    return 1
+  }
+  [ "$filesystem_signature" = swap ] || {
+    echo "owned swapfile has invalid signature '$filesystem_signature': $swapfile_path" >&2
+    return 1
+  }
+}
+
+fstab_has_exact_swap_entry() {
+  local swapfile_path="$1"
+  awk -v swapfile_path="$swapfile_path" '
+    $0 !~ /^[[:space:]]*#/ && NF == 6 &&
+      $1 == swapfile_path && $2 == "none" && $3 == "swap" &&
+      $4 == "sw" && $5 == "0" && $6 == "0" { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' /etc/fstab
+}
+
+cleanup_pending_swapfile() {
+  [ -n "${pending_swapfile_path:-}" ] || return 0
+  if ! swapfile_is_manifest_owned "$pending_runner_number" "$pending_swapfile_path"; then
+    rm -f -- "$pending_swapfile_path"
+  fi
+}
+
 # Keep detection sourceable for dependency-light tests without provisioning the
 # current host.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -113,6 +177,27 @@ if is_orbstack_guest; then
   if [ -n "$legacy_swap_paths" ] && [ "$REMOVE_LEGACY_SWAPFILES" = 0 ]; then
     echo "WARN: legacy numbered swapfiles remain configured and may consume disk; set REMOVE_LEGACY_SWAPFILES=1 to remove them" >&2
   elif [ -n "$legacy_swap_paths" ]; then
+    active_swap_paths="$(swapon --show=NAME --noheadings)"
+    deactivated_legacy_swapfiles=()
+    legacy_swapoff_failed=0
+    while IFS= read -r swapfile_path; do
+      if grep -Fqx "$swapfile_path" <<< "$active_swap_paths"; then
+        if swapoff "$swapfile_path"; then
+          deactivated_legacy_swapfiles+=("$swapfile_path")
+        else
+          echo "could not deactivate legacy swapfile; preserving fstab and files: $swapfile_path" >&2
+          legacy_swapoff_failed=1
+        fi
+      fi
+    done <<< "$legacy_swap_paths"
+    if [ "$legacy_swapoff_failed" = 1 ]; then
+      for swapfile_path in "${deactivated_legacy_swapfiles[@]}"; do
+        swapon "$swapfile_path" || \
+          echo "WARN: could not reactivate legacy swapfile after cleanup abort: $swapfile_path" >&2
+      done
+      exit 1
+    fi
+
     fstab_copy="$(mktemp /etc/fstab.little-ci.XXXXXX)"
     trap 'rm -f "$fstab_copy"' EXIT
     awk '
@@ -125,26 +210,40 @@ if is_orbstack_guest; then
     trap - EXIT
 
     while IFS= read -r swapfile_path; do
-      swapoff "$swapfile_path" 2>/dev/null || true
       rm -f -- "$swapfile_path"
       echo "removed legacy Little-CI swapfile $swapfile_path"
     done <<< "$legacy_swap_paths"
   fi
 else
   echo "== configuring ${SWAP_GB}G swapfile per runner =="
+  pending_swapfile_path=""
+  pending_runner_number=""
   for runner_number in $(seq 1 "$RUNNER_COUNT"); do
     swapfile_path="/swapfile-${RUNNER_NAME_PREFIX}-${runner_number}"
-    if ! swapon --show=NAME --noheadings | grep -Fqx "$swapfile_path"; then
-      if [ ! -f "$swapfile_path" ]; then
-        fallocate -l "${SWAP_GB}G" "$swapfile_path" 2>/dev/null || \
-          dd if=/dev/zero of="$swapfile_path" bs=1M count=$((SWAP_GB * 1024)) status=none
-        chmod 600 "$swapfile_path"
-        mkswap "$swapfile_path" >/dev/null
-        record_created_swapfile "$runner_number" "$swapfile_path"
+    if [ -e "$swapfile_path" ] || [ -L "$swapfile_path" ]; then
+      validate_owned_swapfile "$runner_number" "$swapfile_path"
+    else
+      if ! (set -o noclobber; : > "$swapfile_path") 2>/dev/null; then
+        echo "could not exclusively create Little-CI swapfile: $swapfile_path" >&2
+        exit 1
       fi
+      pending_swapfile_path="$swapfile_path"
+      pending_runner_number="$runner_number"
+      trap cleanup_pending_swapfile EXIT HUP INT TERM
+      if ! fallocate -l "${SWAP_GB}G" "$swapfile_path" 2>/dev/null; then
+        dd if=/dev/zero of="$swapfile_path" bs=1M count=$((SWAP_GB * 1024)) conv=notrunc status=none
+      fi
+      chmod 600 "$swapfile_path"
+      mkswap "$swapfile_path" >/dev/null
+      record_created_swapfile "$runner_number" "$swapfile_path"
+      pending_swapfile_path=""
+      pending_runner_number=""
+      trap - EXIT HUP INT TERM
+    fi
+    if ! swapon --show=NAME --noheadings | grep -Fqx "$swapfile_path"; then
       swapon "$swapfile_path"
     fi
-    grep -Fq "$swapfile_path none swap sw 0 0" /etc/fstab || \
+    fstab_has_exact_swap_entry "$swapfile_path" || \
       echo "$swapfile_path none swap sw 0 0" >> /etc/fstab
   done
 fi

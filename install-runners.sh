@@ -162,7 +162,11 @@ ensure_runner_service() {
 
   (
     cd "$runner_dir"
-    if [ ! -f .service ]; then
+    [ ! -L .service ] || {
+      echo "runner service metadata must not be a symlink: $runner_dir/.service" >&2
+      exit 1
+    }
+    if [ ! -e .service ]; then
       sudo ./svc.sh install "$RUNNER_USER"
     fi
 
@@ -176,6 +180,25 @@ ensure_runner_service() {
       exit 1
     }
     service_unit_file="/etc/systemd/system/$runner_service_name"
+    if ! sudo test -f "$service_unit_file"; then
+      if sudo systemctl is-active --quiet "$runner_service_name"; then
+        echo "runner service '$runner_service_name' is active but its unit file is missing" >&2
+        echo "drain and stop the service before rerunning install-runners.sh" >&2
+        exit 1
+      fi
+      rm -f -- .service
+      sudo ./svc.sh install "$RUNNER_USER"
+      [ -f .service ] && [ ! -L .service ] || {
+        echo "runner service reinstall did not create regular metadata: $runner_dir/.service" >&2
+        exit 1
+      }
+      runner_service_name="$(cat .service)"
+      [[ "$runner_service_name" =~ ^actions\.runner\.[A-Za-z0-9_.@-]+\.service$ ]] || {
+        echo "reinstalled runner service metadata contains an invalid unit name: $runner_dir/.service" >&2
+        exit 1
+      }
+      service_unit_file="/etc/systemd/system/$runner_service_name"
+    fi
     sudo test -f "$service_unit_file" && \
       sudo grep -Fqx -- "ExecStart=$runner_dir/runsvc.sh" "$service_unit_file" && \
       sudo grep -Fqx -- "User=$RUNNER_USER" "$service_unit_file" && \
