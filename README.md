@@ -21,8 +21,8 @@ a 48 GB disk. Increase that only after measuring your jobs on the host Mac.
 For the recommended Mac setup:
 
 - An Apple Silicon Mac. Intel Mac support is intentionally out of scope.
-- [OrbStack](https://orbstack.dev/download) running, with `orbctl` available on
-  `PATH`.
+- [OrbStack](https://orbstack.dev/download) 2.2.3 or newer running, with `orbctl`
+  available on `PATH`. Little-CI is tested against 2.2.3.
 - [GitHub CLI](https://cli.github.com/) authenticated as a repository or
   organization administrator.
 - Python 3 for fleet-specific GitHub API checks.
@@ -47,23 +47,24 @@ For a generic Linux host, use Ubuntu 24.04 with systemd, a non-root runner user,
 Clone Little-CI and create the local configuration:
 
 ```bash
-git clone https://github.com/YOUR-ACCOUNT/Little-CI.git
+git clone https://github.com/ParkerRex/Little-CI.git
 cd Little-CI
 cp config.env.example config.env
 $EDITOR config.env
 ```
 
-At minimum, choose a GitHub target and give the Mac machine a unique name:
+At minimum, choose a GitHub target and a lowercase fleet identity for this Mac:
 
 ```bash
 GITHUB_SCOPE="repository"
 GITHUB_URL="https://github.com/OWNER/REPO"
-ORB_MACHINE="little-ci-owner-repo"
+FLEET_ID="mac-studio"
 ```
 
 The defaults create one runner with the stable workflow label `little-ci` and a
-target-derived, collision-resistant runner name. Then provision, install, and
-verify:
+target-and-fleet-derived name such as
+`little-ci-owner-repo-mac-studio-1`. The OrbStack machine defaults to the same
+prefix without the final runner number. Then provision, install, and verify:
 
 ```bash
 ./provision-orbstack.sh
@@ -138,18 +139,53 @@ gh api --method POST \
   --jq .token
 ```
 
+If GitHub CLI reports a missing organization scope, refresh the authenticated
+login and retry:
+
+```bash
+gh auth refresh -s admin:org
+# Also request repo when the runner group serves private repositories.
+gh auth refresh -s admin:org -s repo
+gh auth status
+```
+
+As an alternative, pass a fine-grained token through `GH_TOKEN` with
+organization **Self-hosted runners: read** for checks or **write** for install
+and removal. Keep it in the process environment only, never `config.env`.
+
 Before registering organization runners, create a dedicated runner group under
 **Organization Settings → Actions → Runner groups**, allow only the repositories
-that need this fleet, and set `RUNNER_GROUP` to its exact name. Little-CI rejects
-`RUNNER_GROUP` for repository-scoped registration. GitHub documents the available
+that need this fleet, and set `RUNNER_GROUP` to its exact name. Organization scope
+requires it; repository scope rejects it. GitHub documents the available
 [runner-group access policies](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
 and [self-hosted runner API permissions](https://docs.github.com/en/rest/actions/self-hosted-runners).
 
-Use a different `ORB_MACHINE` for every target on a Mac. Little-CI derives a
-target-specific runner prefix unless `RUNNER_NAME_PREFIX` is set explicitly.
+Use a stable, lowercase `FLEET_ID` identifying this Mac/fleet location, such as
+`mac-studio`, and do not reuse it for another machine or independent fleet.
+Little-CI lowercases the GitHub target and derives
+`little-ci-<target>-<fleet-id>` for both `RUNNER_NAME_PREFIX` and, by default,
+`ORB_MACHINE`. `RUNNER_NAME_PREFIX` is an advanced compatibility override. If an
+explicit prefix contains uppercase letters, set `ORB_MACHINE` explicitly.
+
 Runner names are `<prefix>-1`, `<prefix>-2`, and so on. Each runner receives the
-stable `little-ci` workflow label, its target-specific fleet label, its exact
-runner-name label, and an architecture label in addition to `RUNNER_LABELS`.
+stable `little-ci` workflow label, its fleet-prefix label, its exact runner-name
+label, and an architecture label in addition to `RUNNER_LABELS`. Registration
+does not use `--replace`; an unexpected name collision fails instead of silently
+taking over another runner.
+
+GitHub labels are limited to 256 characters. Keep `FLEET_ID` and any advanced
+prefix short enough that both the fleet-prefix and `<prefix>-<number>` labels fit;
+each comma-separated `RUNNER_LABELS` entry must also fit.
+
+GitHub access requirements:
+
+- Repository checks need fine-grained **Administration: read**; install and
+  removal need **Administration: write**. A classic token needs `repo`.
+- Organization checks need fine-grained **Self-hosted runners: read**; install
+  and removal need **Self-hosted runners: write**. A classic token needs
+  `admin:org`, plus `repo` when the target group serves private repositories.
+- The authenticated account must also be allowed to administer the configured
+  runner group. Prefer `gh auth login` over keeping a token in `config.env`.
 
 ## Route workflows to Little-CI
 
@@ -173,7 +209,7 @@ jobs:
   test:
     runs-on:
       group: little-ci-approved-repositories
-      labels: [self-hosted, little-ci, little-ci-ORG]
+      labels: [self-hosted, little-ci, little-ci-org-mac-studio]
 ```
 
 Do not use `ubuntu-24.04` in `runs-on`; that identifies GitHub-hosted runner
@@ -201,14 +237,27 @@ you intend GitHub to schedule work on them.
 `provision-orbstack.sh` runs on macOS. It creates an Ubuntu 24.04 arm64 machine
 with both OrbStack isolation modes enabled, installs base packages and Docker,
 creates the runner account, copies this repository into the isolated guest, and
-invokes guest provisioning. Re-runs validate an existing machine before using it
-instead of treating any same-named machine as compatible.
+invokes guest provisioning. A new machine receives a root-owned identity at
+`/etc/little-ci/identity` tying its machine, GitHub target, fleet prefix, user,
+and runner home together. The identity directory is mode `0700` and the file is
+mode `0600`.
 
-`provision-box.sh` runs as root inside Ubuntu. It creates per-runner scratch
-directories, adds systemd service drop-ins for `TMPDIR` and `TMP`, and configures
-`systemd-tmpfiles` to age abandoned scratch files. On a normal Linux server it
-also creates the configured swapfiles and sets low swappiness. It skips that
-swapfile work in OrbStack.
+Before any later install, uninstall, or machine deletion, Little-CI validates the
+machine's name, Ubuntu release, arm64 architecture, both isolation flags, zero
+Mac mounts, disabled SSH-agent forwarding, default user, and protected fleet
+identity. Provisioning also validates configured CPU, memory, and disk limits.
+OrbStack 2.2.3 legitimately omits an empty mounts field from machine JSON, so
+`orbctl config get machine.<name>.mounts` is the authoritative mount check and
+must succeed with empty output. Any missing required JSON field, unreadable or
+nonempty mount setting, or ownership mismatch fails closed instead of treating a
+same-named machine as compatible.
+
+`provision-box.sh` runs as root inside Ubuntu. It creates fleet-isolated scratch
+directories at `/scratch/<prefix>/<runner-number>` and a fleet-specific
+`systemd-tmpfiles` cleanup policy. On a normal Linux server it also creates the
+fleet-qualified `/swapfile-<prefix>-<runner-number>` files, records ownership in
+`/var/lib/little-ci/fleets/<prefix>/managed-swapfiles`, and sets low swappiness.
+It skips swapfile creation in OrbStack.
 
 `install-runners-orb.sh` runs on macOS. It copies the current checkout to the
 isolated guest without relying on a Mac filesystem mount, obtains or forwards a
@@ -216,8 +265,28 @@ short-lived registration token, and invokes `install-runners.sh`. Service instal
 is performed through the Mac wrapper as root; the OrbStack guest does not retain
 a passwordless-sudo grant for the runner user.
 
+Mac-to-guest transfer is an explicit runtime allowlist, not a copy of the whole
+checkout. Provisioning sends the guest provision/install/uninstall/Postgres
+scripts and their two `lib/` helpers; installation sends only its guest installer
+and GitHub-target helper. Both include `config.env` when present. They do not send
+docs, tests, examples, `.git`, runner credentials/workspaces, archives, or
+arbitrary untracked files. Keep `config.env` limited to the documented local
+settings; GitHub credentials are rejected and tokens travel only through the
+single command environment that consumes them.
+
 `install-runners.sh` runs in Linux. It downloads the pinned GitHub Actions runner,
 registers the requested fleet, and installs a systemd service for each runner.
+The runner directory's generated `.service` file is the authoritative unit name.
+The installer verifies that unit's executable, user, and working directory before
+writing `zz-little-ci-scratch.conf` to bind the exact service to its fleet scratch
+directory. Provisioning also configures `needrestart` not to interrupt active
+`actions.runner.*` services during package maintenance.
+
+An unchanged drop-in is safe to reuse while its service is active. If an active
+service has a missing or different Little-CI drop-in, installation fails before
+overwriting it or restarting the service. Let the job drain, confirm GitHub no
+longer reports it busy, stop the exact unit named by `doctor.sh`, rerun
+`install-runners-orb.sh`, and finish with `doctor.sh` plus `check-runners.sh`.
 
 `check-runners.sh` runs wherever `gh` and Python 3 are available. It reads every
 page of the repository or organization runner API and checks only this fleet's
@@ -245,22 +314,30 @@ For a local view, inspect the OrbStack machine and the services inside it:
 ./doctor.sh
 orbctl list
 source config.env
+source lib/github-target.sh
+github_target_init
+github_fleet_init
+ORB_MACHINE="${ORB_MACHINE:-$RUNNER_NAME_PREFIX}"
 orbctl run -m "$ORB_MACHINE" -u root \
   systemctl list-units 'actions.runner.*' --type=service --no-pager
 orbctl logs "$ORB_MACHINE"
 ```
 
-`doctor.sh` is read-only. It checks the OrbStack CLI and daemon, machine image and
-isolation settings, SSH-agent forwarding, login and sleep settings, Docker access,
-systemd services, and this exact fleet's GitHub registrations. Warnings do not
-fail the command; any failed invariant does.
+`doctor.sh` is read-only. It checks the OrbStack CLI and daemon, complete machine
+security metadata, protected identity, login and sleep settings, Docker access,
+local registrations, authoritative systemd services, installed runner versions,
+GitHub labels, and organization runner-group membership. Warnings do not fail the
+command; any failed invariant does. Runner checks always require the stable
+`little-ci` label in addition to configured, fleet-prefix, exact-name, and arm64
+labels.
 
 ### Updates
 
-GitHub's runner service updates itself when GitHub requires a newer release.
-`RUNNER_VERSION` pins new installations; changing it does not replace an already
-registered runner directory. Re-run provisioning and installation to refresh
-configuration and reconcile missing runners or services:
+The official GitHub runner automatically self-updates by default.
+`RUNNER_VERSION` is only the bootstrap version for new installations; changing it
+does not replace an already registered runner directory. Re-run provisioning and
+installation to refresh host configuration and start or recreate missing local
+runners or services:
 
 ```bash
 ./provision-orbstack.sh
@@ -274,15 +351,22 @@ job is intentional. To force a clean version change, remove one exact idle runne
 with `--runner`, change `RUNNER_VERSION`, re-run installation, and verify it before
 moving to the next runner.
 
+Re-running install intentionally preserves an existing local registration. It
+does not change that runner's server-side labels or organization runner group.
+After changing `RUNNER_LABELS` or `RUNNER_GROUP`, run `doctor.sh`, then use the
+exact idle `--runner` uninstall and reinstall flow for every affected runner.
+Drop-in drift alone does not require GitHub unregistration; use the drain, stop,
+and installer-rerun flow described above.
+
 `doctor.sh` reports each installed `Runner.Listener` version and warns when it
 differs from the bootstrap pin. Little-CI does not automate Ubuntu distribution
 upgrades; treat guest OS upgrades as explicit administrator maintenance, then run
 provision, doctor, and health checks again.
 
-Re-run `provision-orbstack.sh` after changing compatible resource or host
-configuration. Existing-machine validation fails closed when the named machine
-has the wrong architecture, distro, or isolation settings; review the mismatch
-rather than deleting a machine blindly.
+Re-run `provision-orbstack.sh` after changing compatible host configuration.
+Resource settings are part of strict machine validation, so changing
+`ORB_CPUS`, `ORB_MEMORY`, or `ORB_DISK` requires changing the existing OrbStack
+machine settings to match before provisioning will continue.
 
 ### Removal and recovery
 
@@ -294,7 +378,7 @@ Every removal requires both an exact selection mode and `--confirm`:
 
 # Remove one exact fleet runner.
 ./uninstall-runners-orb.sh \
-  --runner little-ci-OWNER-REPO-2 --confirm
+  --runner little-ci-owner-repo-mac-studio-2 --confirm
 
 # Remove this entire fleet but retain the machine.
 ./uninstall-runners-orb.sh --all --confirm
@@ -307,9 +391,35 @@ The Mac wrapper fetches a short-lived GitHub removal token, stops and unregister
 the selected local services, then deletes only matching offline stale GitHub
 registrations. Before any of those mutations it queries GitHub and refuses to
 interrupt a selected runner with `busy: true`. `--prune` selects numbered runners
-above `RUNNER_COUNT`.
+above `RUNNER_COUNT`. Local cleanup uses each selected runner's authoritative
+`.service` metadata and removes only its service drop-in, fleet scratch directory,
+tmpfiles entry, and manifest-owned generic-Linux swapfile.
 `--delete-machine` is accepted only with `--all`, and the machine is otherwise
 retained. Review any `busy` runner reported by `doctor.sh` before removal.
+
+If guest unregistration or owned-resource cleanup fails, the wrapper stops before
+stale-registration deletion or machine deletion, retains the recoverable state,
+and prints targeted recovery steps. Machine security metadata and protected
+identity are validated again immediately before an explicit delete. Teardown
+intentionally ignores CPU, memory, and disk-size drift so resource changes cannot
+block safe unregistration or recovery.
+
+Local teardown is deliberately recoverable. After validating `.runner`, the
+authoritative service/unit/drop-in, and selected resource ownership, it atomically
+creates a protected record at
+`/var/lib/little-ci/fleets/<prefix>/pending-cleanup/<runner-number>`. The state
+directories are root-owned mode `0700`; the regular record is root-owned mode
+`0600` and binds the exact runner number, name, directory, GitHub target, and
+service name.
+
+Only then does teardown uninstall the service and ask GitHub to unregister the
+runner. Owned drop-in, scratch, tmpfiles, swap, and runner-directory cleanup
+happens after successful unregistration. The pending-cleanup record is removed
+last. If unregistration or cleanup is interrupted, rerun the same confirmed
+selection: Little-CI validates the protected record and safely resumes even when
+GitHub's `config.sh remove` already deleted `.runner`. An untrusted, malformed,
+or mismatched record blocks mutation. If a later GitHub list/delete call fails,
+the wrapper exits nonzero and retains the OrbStack machine.
 
 On a generic Linux host, obtain a removal token from the matching repo/org API and
 use the same selection modes:
@@ -392,37 +502,49 @@ before exposing the fleet to additional repositories.
 project directory. Copy it from `config.env.example`, keep it untracked, quote
 values containing special characters, and treat edits as trusted code.
 
+After provisioning, `ORB_MACHINE`, `GITHUB_SCOPE`, `GITHUB_URL`, the resolved
+runner prefix, `RUNNER_USER`, and `RUNNER_HOME` form the protected machine
+identity. Changing one intentionally selects a different fleet; it is not an
+in-place rename.
+
 GitHub target and runner settings:
 
 - `GITHUB_SCOPE`: `repository` or `organization`; defaults to `repository`.
 - `GITHUB_URL`: exact `https://github.com/OWNER/REPO` or
   `https://github.com/ORG` URL matching the selected scope.
-- `RUNNER_GROUP`: optional organization runner group name; invalid with repository
+- `RUNNER_GROUP`: required organization runner group name; invalid with repository
   scope.
+- `FLEET_ID`: required lowercase identity when `RUNNER_NAME_PREFIX` is unset.
+  Choose a short Mac/location name such as `mac-studio` and keep it stable. It
+  must start with a letter or digit and may also contain `.`, `_`, and `-`.
 - `RUNNER_COUNT`: number of runner services to install; default and recommended
   starting value is `1`.
 - `EXPECTED_RUNNERS`: health-check fleet size; normally equal to `RUNNER_COUNT`.
-- `RUNNER_NAME_PREFIX`: stable, target-unique fleet and name prefix. If unset,
-  Little-CI derives it from `GITHUB_URL`.
+- `RUNNER_NAME_PREFIX`: advanced explicit compatibility override. Normally
+  Little-CI derives `little-ci-<lowercase-target>-<fleet-id>`.
 - `RUNNER_LABELS`: comma-separated additional labels. The stable `little-ci`,
-  fleet, exact-name, and architecture labels are added automatically.
+  fleet, exact-name, and architecture labels are added automatically. Every
+  resulting label must be at most 256 characters.
 - `RUNNER_VERSION`: pinned `actions/runner` release.
 - `RUNNER_ARCH`: guest package architecture. OrbStack is fixed to `linux-arm64`;
   generic Linux can detect `linux-arm64` or `linux-x64`.
-- `RUNNER_USER`: non-root Linux account used by runner services.
-- `RUNNER_HOME`: optional runner install parent inside Linux.
+- `RUNNER_USER`: non-root Linux account used by runner services; `root` is
+  rejected.
+- `RUNNER_HOME`: runner install parent inside Linux; defaults to the configured
+  user's home, `/home/<RUNNER_USER>`, on OrbStack.
 
 OrbStack settings:
 
 - `ORB_MACHINE`: target-unique OrbStack machine name. If unset, it defaults to the
-  target-derived runner prefix, such as `little-ci-OWNER-REPO`.
+  derived runner prefix, such as `little-ci-owner-repo-mac-studio`.
 - `ORB_CPUS`: guest CPU limit; defaults to `2`.
 - `ORB_MEMORY`: guest memory limit; defaults to `4G`.
 - `ORB_DISK`: guest disk limit; defaults to `48G`.
 
 Linux host settings:
 
-- `SWAP_GB`: size of each per-runner swapfile on a normal Linux host; ignored in
+- `SWAP_GB`: size of each fleet-qualified
+  `/swapfile-<prefix>-<runner-number>` on a normal Linux host; ignored in
   OrbStack.
 - `SWAPPINESS`: Linux swap preference on a normal Linux host.
 - `REAP_AGE`: age at which systemd-tmpfiles can remove scratch entries.
@@ -446,9 +568,19 @@ each matrix job, placing it first in `search_path`, and dropping it in a guarded
 
 ```bash
 source config.env
+source lib/github-target.sh
+github_target_init
+github_fleet_init
+RUNNER_USER="${RUNNER_USER:-deploy}"
+RUNNER_HOME="${RUNNER_HOME:-/home/$RUNNER_USER}"
+ORB_MACHINE="${ORB_MACHINE:-$RUNNER_NAME_PREFIX}"
 orbctl run -m "$ORB_MACHINE" -u root \
-  bash -lc 'cd /home/deploy/little-ci && ./provision-postgres.sh'
+  bash -c 'cd "$1/little-ci" && ./provision-postgres.sh' \
+  bash "$RUNNER_HOME"
 ```
+
+The guest-side script sources the copied `config.env`, so re-run
+`provision-orbstack.sh` first if PostgreSQL settings changed.
 
 This is a lightweight test convenience, not strong tenant isolation:
 
@@ -524,13 +656,23 @@ selected jobs first. Prefer the Mac wrapper for OrbStack fleets.
 The OrbStack machine is rejected during provisioning:
 
 - Read the reported mismatch. Little-CI validates same-named machines to avoid
-  silently reusing a non-isolated or wrong-architecture machine.
-- Choose another `ORB_MACHINE`, or correct the existing machine's configuration
-  and restart it. Do not delete an unknown machine to make the error disappear.
+  silently reusing a non-isolated, mounted, SSH-forwarding, wrong-architecture,
+  or differently owned machine.
+- A machine created before protected fleet identities existed is not adopted
+  automatically. Safely unregister its old runners, preserve any needed data,
+  then create a new derived machine; do not forge `/etc/little-ci/identity`.
+- Correct a known machine's resource or isolation settings only after confirming
+  its ownership. Otherwise choose a new `FLEET_ID` or explicit `ORB_MACHINE`.
+  Do not delete an unknown machine to make the error disappear.
 
 A runner is offline after a restart:
 
 ```bash
+source config.env
+source lib/github-target.sh
+github_target_init
+github_fleet_init
+ORB_MACHINE="${ORB_MACHINE:-$RUNNER_NAME_PREFIX}"
 orbctl start "$ORB_MACHINE"
 orbctl run -m "$ORB_MACHINE" -u root \
   systemctl list-units 'actions.runner.*' --type=service --no-pager

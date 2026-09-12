@@ -16,9 +16,11 @@ clear requirement.
 Mac-side orchestration:
 
 - `provision-orbstack.sh` owns OrbStack machine creation, compatibility checks,
-  guest bootstrap, and invoking guest provisioning.
+  root-owned fleet identity creation, guest bootstrap, and invoking guest
+  provisioning.
 - `install-runners-orb.sh` owns copying this checkout into the isolated guest,
-  obtaining or forwarding the registration token, and invoking runner install.
+  verifying machine identity, obtaining or forwarding the registration token,
+  invoking runner registration, and root-side service setup.
 - `doctor.sh` is read-only Mac-side diagnosis across OrbStack, the guest, and the
   configured GitHub fleet.
 - `uninstall-runners-orb.sh` owns confirmed Mac-side selection, removal-token
@@ -26,10 +28,11 @@ Mac-side orchestration:
 
 Linux guest or server operations:
 
-- `provision-box.sh` owns physical-host swap policy, runner scratch directories,
-  tmpfiles cleanup, and systemd drop-ins.
+- `provision-box.sh` owns physical-host swap policy and its ownership manifest,
+  fleet/runner scratch directories, and fleet-specific tmpfiles cleanup.
 - `install-runners.sh` owns runner download, registration, directories, and
-  systemd service installation.
+  systemd service installation. The generated `.service` file is authoritative;
+  the installer validates that unit before writing its scratch drop-in.
 - `provision-postgres.sh` owns only the optional local CI database.
 - `uninstall-runners.sh` owns only explicitly selected runners matching the
   configured fleet prefix, GitHub target, and install root.
@@ -38,6 +41,10 @@ Shared/read-only operations:
 
 - `check-runners.sh` reads GitHub's repository or organization runner API and
   evaluates only the configured fleet.
+- `lib/github-target.sh` is the single source of truth for GitHub scope, target,
+  fleet identity, API path, and derived runner prefix.
+- `lib/orbstack-machine.sh` is the single source of truth for OrbStack JSON
+  validation and protected machine identity.
 - `config.env.example` is the canonical public configuration contract.
 - `examples/` contains opt-in consuming-project workflows, not workflows that
   operate this repository automatically.
@@ -45,6 +52,12 @@ Shared/read-only operations:
 OrbStack machines are created without Mac filesystem mounts. Do not introduce a
 dependency on `/mnt/mac`, forwarded SSH agents, Mac command bridging, or shared
 host paths. Transfer the minimum required files explicitly.
+
+Mac wrappers must build guest archives from an explicit runtime-file allowlist.
+Never archive `.` or copy arbitrary untracked files, docs, tests, examples,
+`.git`, runner state, or credentials. Include `config.env` only as the optional
+validated local configuration file; registration/removal tokens use the narrow
+environment bridge instead.
 
 ## Configuration contract
 
@@ -69,6 +82,22 @@ When adding or changing a setting:
 The OrbStack path is arm64-only. Generic Linux may support `linux-arm64` and
 `linux-x64`; do not generalize that into Intel Mac support.
 
+`FLEET_ID` is required when `RUNNER_NAME_PREFIX` is unset. It must be lowercase,
+stable, and unique to one fleet on the host. The normal prefix and machine name
+are `little-ci-<lowercase-target>-<fleet-id>`. Treat an explicit
+`RUNNER_NAME_PREFIX` as an advanced compatibility override. Organization scope
+requires a nonblank `RUNNER_GROUP`; repository scope rejects it.
+
+Reject `RUNNER_USER=root`. Validate every GitHub label at the boundary: each
+configured label, fleet-prefix label, and exact runner-name label is limited to
+256 characters.
+
+Keep GitHub permission documentation exact: repository health reads require
+Administration read and mutations require Administration write; organization
+health reads require Self-hosted runners read and mutations require Self-hosted
+runners write. Classic tokens use `repo` for repositories or `admin:org` for
+organizations, with `repo` additionally required for private repositories.
+
 ## Naming
 
 Use domain-specific names. Avoid placeholders such as `data`, `handler`, `temp`,
@@ -78,10 +107,11 @@ Use domain-specific names. Avoid placeholders such as `data`, `handler`, `temp`,
 - Exported/configuration variables: uppercase snake case.
 - Functions: lowercase snake case beginning with a clear verb.
 - Scripts: lowercase kebab case describing the operation and target.
-- Runner fleets: stable, target-unique `RUNNER_NAME_PREFIX`.
+- Runner fleet input: stable lowercase `FLEET_ID`.
+- Runner fleets: derived, target-and-fleet-unique `RUNNER_NAME_PREFIX`.
 - Runner instances: `<prefix>-<number>`.
-- OrbStack machines: stable, target-unique `ORB_MACHINE`; do not assume `ci` is
-  globally available.
+- OrbStack machines: derived `ORB_MACHINE` by default; an explicit value must
+  remain stable and target/fleet-unique.
 
 Centralize parsing and validation when multiple scripts must produce the exact
 same GitHub scope, slug, API path, fleet prefix, or service identity. Do not allow
@@ -105,31 +135,73 @@ slightly different copies of target logic to drift.
 
 Before mutating an existing OrbStack machine, inspect and validate the exact
 configured name, architecture, distribution/version, isolation, network
-isolation, resource settings, and runner ownership. Fail closed on a mismatch.
+isolation, empty mount list, disabled SSH-agent forwarding, default user,
+resource settings when provisioning, and runner ownership. Fail closed on a
+mismatch or unreadable OrbStack JSON. OrbStack 2.2.3 is the tested minimum.
+OrbStack 2.2.3 omits an empty mounts field from JSON. Treat a successful, empty
+`orbctl config get machine.<name>.mounts` as the sole authoritative mount check;
+an unreadable or nonempty result is a failure.
+Teardown intentionally skips resource-size matching so drift cannot block safe
+unregistration, cleanup, or deletion, but still requires every security and
+identity check.
+
+Every managed machine has `/etc/little-ci/identity`: root-owned mode `0600`
+inside a root-owned mode `0700` directory. Its machine, scope, target, prefix,
+user, and runner-home values must match before install, uninstall, or deletion.
+Never add an automatic adoption or identity-rewrite path for an existing machine.
 
 - Never delete or recreate a same-named machine automatically.
 - Never unregister, stop, or remove all self-hosted runners broadly.
 - Match the configured prefix, exact expected names, and fleet label.
-- Check `busy` state before update, restart, removal, or downscaling. Fail unless
-  the operator explicitly chose a force path.
+- Check `busy` state before update, restart, removal, or downscaling. Fail rather
+  than interrupting a job; do not introduce an implicit force path.
 - Unregister a runner from the correct repository or organization before removing
   its local credential directory.
 - Make machine deletion a separate explicit choice after fleet uninstall.
 - Preserve unrelated services, runners, files, images, and machines.
+- Use `.runner` for registration ownership and `.service` for the authoritative
+  systemd unit. Validate the unit's executable, user, and working directory.
+- Remove only selected runner resources: its exact service drop-in,
+  `/scratch/<prefix>/<number>`, tmpfiles entry, and manifest-owned generic-Linux
+  `/swapfile-<prefix>-<number>`. Never infer swapfile ownership from its filename
+  alone.
 - Use exact paths and validated names for destructive commands. Avoid globs when
   deleting live state.
 - If cleanup fails halfway, report the remaining GitHub registrations, services,
   directories, and an exact recovery command. Do not hide partial failure.
 
+Preserve recoverable teardown order: validate runner/service/resource ownership;
+atomically create the protected pending-cleanup record; uninstall the exact
+service; unregister through GitHub; remove the owned drop-in,
+scratch/tmpfiles/manifest-owned swap state and runner directory; then remove the
+record last. The root-owned `0700` directory and regular `0600` record bind the
+runner number, name, directory, target, and service under
+`/var/lib/little-ci/fleets/<prefix>/pending-cleanup/<number>`.
+
+Record creation failure permits no mutation. Retain and validate the record on
+unregister/cleanup interruption so a retry can safely continue after `.runner`
+is gone. Reject malformed, symlinked, misowned, or mismatched records. Any failed
+remote list/delete must prevent machine deletion.
+
 Provision and install operations should remain idempotent. A re-run may reconcile
 known state, but it must not silently adopt incompatible or ambiguously owned
 state.
 
+Existing registrations are retained without `--replace`. A re-run may restore
+their exact local service/drop-in, but it must not claim to reconcile server-side
+labels or runner-group membership. Label/group changes require doctor, exact idle
+uninstall, reinstall, and verification. Preserve the `needrestart` override that
+prevents package maintenance from interrupting `actions.runner.*` services.
+
+Never overwrite a missing or changed owned drop-in for an active service. Fail
+with drain/stop/installer-rerun guidance. An unchanged active drop-in is valid;
+an inactive service may receive the desired drop-in before it starts.
+
 ## Security invariants
 
 - Default to repository scope. Organization scope must be explicit.
-- Reject `RUNNER_GROUP` outside organization scope and document restricted group
-  access for organization fleets.
+- Require `RUNNER_GROUP` for organization scope, reject it for repository scope,
+  and document restricted repository access for organization fleets.
 - Keep both OrbStack `--isolated` and `--isolate-network` enabled.
 - Do not add Mac mounts, host access, SSH-agent forwarding, or inbound services to
   make a workflow convenient.
@@ -138,8 +210,11 @@ state.
   workflows.
 - Runner Docker access is root-equivalent inside the guest. Do not restore a
   permanent passwordless-sudo grant to the OrbStack runner user.
+- The configured runner account itself must never be `root`.
 - Health and lifecycle checks must be fleet-specific so unrelated online runners
   cannot create a false green result.
+- Always verify the stable `little-ci` label as well as configured,
+  fleet-prefix, exact-name, and architecture labels.
 
 ## Code style
 
@@ -179,9 +254,13 @@ registration. Mock commands at the process boundary and cover:
 - target-derived default names and explicit names;
 - arm64 OrbStack enforcement;
 - existing-machine compatibility rejection;
+- protected machine identity and no-mount/no-SSH-forward checks;
 - OrbStack swap skipping and normal-Linux swap behavior;
+- fleet-specific scratch, authoritative service drop-ins, and selected cleanup;
+- protected pending-cleanup creation, retry, and malformed-state rejection;
 - fleet-specific pagination and missing/offline/busy states;
-- install, self-update/reconcile, unregister, and partial-failure recovery paths;
+- no-replace install, label/group drift, automatic self-update, unregister, and
+  partial-failure recovery paths;
 - secret non-disclosure.
 
 Live smoke tests are supplemental and require an explicit target. Never point a
