@@ -5,9 +5,9 @@
 #   1. Swap        — one swapfile PER runner on generic Linux. OrbStack guests
 #                    use OrbStack-managed zram/swap instead.
 #   2. swappiness  — low (default 10) so the box only swaps under real pressure.
-#   3. Scratch     — a per-runner /scratch/N with a systemd TMPDIR drop-in, so
-#                    runners don't contend on a single shared /tmp.
-#   4. Reaper      — ages /tmp + every /scratch/N (default 6h) via systemd-tmpfiles,
+#   3. Scratch     — per-fleet, per-runner scratch directories so runners do not
+#                    contend on a single shared /tmp.
+#   4. Reaper      — ages /tmp + fleet scratch (default 6h) via systemd-tmpfiles,
 #                    so dead job-workspace dirs can't accumulate and fill the disk.
 #
 # Safe to re-run. Run as root ON the box:
@@ -15,8 +15,8 @@
 # or from your laptop:
 #     ssh root@BOX 'bash -s' < provision-box.sh      # (with env vars exported inline)
 #
-# Run this BEFORE install-runners.sh — the TMPDIR drop-ins are then already in
-# place when the runner services first start.
+# Run this BEFORE install-runners.sh so fleet scratch exists before the installer
+# binds each runner's registered systemd service to its directory.
 is_orbstack_guest() {
   local guest_marker kernel_release_file
   guest_marker="${LITTLE_CI_ORBSTACK_GUEST_MARKER:-/opt/orbstack-guest}"
@@ -24,6 +24,43 @@ is_orbstack_guest() {
 
   [ -e "$guest_marker" ] || \
     { [ -r "$kernel_release_file" ] && grep -Fqi orbstack "$kernel_release_file"; }
+}
+
+record_created_swapfile() {
+  local runner_number="$1" swapfile_path="$2" ownership_record manifest_metadata
+  local manifest_dir
+  manifest_dir="$(dirname "$swap_ownership_manifest")"
+
+  if [ -L "$manifest_dir" ] || [ -L "$swap_ownership_manifest" ]; then
+    echo "refusing symlinked swap ownership state: $swap_ownership_manifest" >&2
+    return 1
+  fi
+  if [ -e "$manifest_dir" ]; then
+    manifest_metadata="$(stat -c '%u:%g:%a' "$manifest_dir")"
+    [ "$manifest_metadata" = 0:0:700 ] || {
+      echo "swap ownership directory must be root-owned mode 700: $manifest_dir" >&2
+      return 1
+    }
+  else
+    install -d -o root -g root -m 700 "$manifest_dir"
+  fi
+  if [ -e "$swap_ownership_manifest" ]; then
+    [ -f "$swap_ownership_manifest" ] || {
+      echo "swap ownership manifest is not a regular file: $swap_ownership_manifest" >&2
+      return 1
+    }
+    manifest_metadata="$(stat -c '%u:%g:%a' "$swap_ownership_manifest")"
+    [ "$manifest_metadata" = 0:0:600 ] || {
+      echo "swap ownership manifest must be root-owned mode 600: $swap_ownership_manifest" >&2
+      return 1
+    }
+  else
+    install -o root -g root -m 600 /dev/null "$swap_ownership_manifest"
+  fi
+
+  ownership_record="$(printf '%s\t%s' "$runner_number" "$swapfile_path")"
+  grep -Fqx "$ownership_record" "$swap_ownership_manifest" || \
+    printf '%s\n' "$ownership_record" >> "$swap_ownership_manifest"
 }
 
 # Keep detection sourceable for dependency-light tests without provisioning the
@@ -43,20 +80,18 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 reject_persisted_github_credentials "$script_dir/config.env"
 [ -f "$script_dir/config.env" ] && . "$script_dir/config.env"
 github_target_init
+github_fleet_init
 
 RUNNER_COUNT="${RUNNER_COUNT:-1}"
 SWAP_GB="${SWAP_GB:-10}"
 SWAPPINESS="${SWAPPINESS:-10}"
 REAP_AGE="${REAP_AGE:-6h}"
 REMOVE_LEGACY_SWAPFILES="${REMOVE_LEGACY_SWAPFILES:-0}"
-RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-little-ci-${GITHUB_TARGET//\//-}}"
-
-# The runner services are named  actions.runner.<owner>-<repo>.<name>.service
-# by GitHub's svc.sh. Derive that prefix so we can write each TMPDIR drop-in.
-service_target="${GITHUB_TARGET//\//-}"
-service_name_prefix="actions.runner.${service_target}.${RUNNER_NAME_PREFIX}"
+RUNNER_USER="${RUNNER_USER:-deploy}"
+swap_ownership_manifest="/var/lib/little-ci/fleets/$RUNNER_NAME_PREFIX/managed-swapfiles"
 
 [ "$(id -u)" -eq 0 ] || { echo "provision-box.sh must run as root" >&2; exit 1; }
+[ "$RUNNER_USER" != root ] || { echo "RUNNER_USER must be a dedicated non-root account" >&2; exit 1; }
 [[ "$RUNNER_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "RUNNER_COUNT must be a positive integer" >&2; exit 1; }
 [[ "$SWAP_GB" =~ ^[1-9][0-9]*$ ]] || { echo "SWAP_GB must be a positive integer" >&2; exit 1; }
 case "$REMOVE_LEGACY_SWAPFILES" in
@@ -98,13 +133,14 @@ if is_orbstack_guest; then
 else
   echo "== configuring ${SWAP_GB}G swapfile per runner =="
   for runner_number in $(seq 1 "$RUNNER_COUNT"); do
-    swapfile_path="/swapfile$runner_number"
+    swapfile_path="/swapfile-${RUNNER_NAME_PREFIX}-${runner_number}"
     if ! swapon --show=NAME --noheadings | grep -Fqx "$swapfile_path"; then
       if [ ! -f "$swapfile_path" ]; then
         fallocate -l "${SWAP_GB}G" "$swapfile_path" 2>/dev/null || \
           dd if=/dev/zero of="$swapfile_path" bs=1M count=$((SWAP_GB * 1024)) status=none
         chmod 600 "$swapfile_path"
         mkswap "$swapfile_path" >/dev/null
+        record_created_swapfile "$runner_number" "$swapfile_path"
       fi
       swapon "$swapfile_path"
     fi
@@ -116,30 +152,27 @@ fi
 # --- 2. swappiness, persisted ---
 sysctl -w vm.swappiness="$SWAPPINESS" >/dev/null
 echo "vm.swappiness=$SWAPPINESS" > /etc/sysctl.d/99-little-ci-swappiness.conf
-rm -f /etc/sysctl.d/99-ci-swappiness.conf
 
-# --- 3. Per-runner isolated scratch + systemd TMPDIR drop-in ---
+# --- 3. Per-fleet, per-runner scratch ---
 reaper_config="D /tmp 1777 root root $REAP_AGE"
+scratch_root="/scratch/$RUNNER_NAME_PREFIX"
+mkdir -p "$scratch_root"
+chmod 755 "$scratch_root"
 for runner_number in $(seq 1 "$RUNNER_COUNT"); do
-  scratch_dir="/scratch/$runner_number"
+  scratch_dir="$scratch_root/$runner_number"
   mkdir -p "$scratch_dir"
   chmod 1777 "$scratch_dir"
-  service_drop_in_dir="/etc/systemd/system/${service_name_prefix}-$runner_number.service.d"
-  mkdir -p "$service_drop_in_dir"
-  printf '[Service]\nEnvironment=TMPDIR=%s\nEnvironment=TMP=%s\n' "$scratch_dir" "$scratch_dir" \
-    > "$service_drop_in_dir/tmpdir.conf"
   reaper_config+=$'\n'"D $scratch_dir 1777 root root $REAP_AGE"
 done
 
-# --- 4. Reaper: age /tmp + each /scratch/N ---
-printf '%s\n' "$reaper_config" > /etc/tmpfiles.d/little-ci-runner-scratch.conf
-rm -f /etc/tmpfiles.d/runner-scratch.conf
+# --- 4. Reaper: age /tmp + this fleet's scratch ---
+tmpfiles_policy="/etc/tmpfiles.d/little-ci-${RUNNER_NAME_PREFIX}-scratch.conf"
+printf '%s\n' "$reaper_config" > "$tmpfiles_policy"
 
-systemctl daemon-reload 2>/dev/null || true
-systemd-tmpfiles --create /etc/tmpfiles.d/little-ci-runner-scratch.conf 2>/dev/null || true
+systemd-tmpfiles --create "$tmpfiles_policy" 2>/dev/null || true
 
 echo "== done =="
 swapon --show
 echo "swappiness=$(sysctl -n vm.swappiness)"
 df -h / | tail -1
-echo "NOTE: TMPDIR drop-ins apply on the next runner (re)start."
+echo "NOTE: install-runners.sh binds each registered service to its fleet scratch directory."

@@ -11,32 +11,8 @@ fail() {
   exit 1
 }
 
-memory_size_to_mib() {
-  local configured_size="$1" size_number multiplier
-  case "$configured_size" in
-    *GiB) size_number="${configured_size%GiB}"; multiplier=1024 ;;
-    *G) size_number="${configured_size%G}"; multiplier=1024 ;;
-    *MiB) size_number="${configured_size%MiB}"; multiplier=1 ;;
-    *M) size_number="${configured_size%M}"; multiplier=1 ;;
-    *) size_number="$configured_size"; multiplier=1 ;;
-  esac
-  [[ "$size_number" =~ ^[1-9][0-9]*$ ]] || return 1
-  printf '%s\n' "$((size_number * multiplier))"
-}
-
-disk_size_to_bytes() {
-  local configured_size="$1" size_number
-  case "$configured_size" in
-    *GiB) size_number="${configured_size%GiB}" ;;
-    *G) size_number="${configured_size%G}" ;;
-    *) size_number="$configured_size" ;;
-  esac
-  [[ "$size_number" =~ ^[1-9][0-9]*$ ]] || return 1
-  printf '%s\n' "$((size_number * 1024 * 1024 * 1024))"
-}
-
-cleanup_repository_archive() {
-  [ -z "${repository_archive_path:-}" ] || rm -f -- "$repository_archive_path"
+cleanup_guest_runtime_archive() {
+  [ -z "${guest_runtime_archive_path:-}" ] || rm -f -- "$guest_runtime_archive_path"
 }
 
 require_apple_silicon_mac() {
@@ -50,11 +26,13 @@ require_apple_silicon_mac() {
     fail "Little-CI requires an Apple Silicon Mac (found $host_architecture)"
   command -v orbctl >/dev/null 2>&1 || \
     fail "orbctl is not on PATH; install and start OrbStack first"
-  command -v plutil >/dev/null 2>&1 || \
-    fail "plutil is required to validate OrbStack machine settings"
+  command -v python3 >/dev/null 2>&1 || \
+    fail "python3 is required to validate OrbStack machine settings"
 }
 
 validate_config() {
+  [ "$RUNNER_USER" != root ] || \
+    fail "RUNNER_USER must be a dedicated non-root account"
   [[ "$RUNNER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || \
     fail "RUNNER_USER must be a valid Linux username"
   [[ "$RUNNER_NAME_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
@@ -63,42 +41,48 @@ validate_config() {
     fail "ORB_MACHINE may contain only letters, numbers, dots, underscores, and hyphens"
   [[ "$RUNNER_HOME" = /* && "$RUNNER_HOME" != / ]] || \
     fail "RUNNER_HOME must be an absolute, non-root path"
+  [[ "$RUNNER_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || \
+    fail "RUNNER_HOME contains unsupported characters"
   [[ "$ORB_CPUS" =~ ^[1-9][0-9]*$ ]] || \
     fail "ORB_CPUS must be a positive integer"
   [[ "$RUNNER_COUNT" =~ ^[1-9][0-9]*$ ]] || \
     fail "RUNNER_COUNT must be a positive integer"
-  expected_memory_mib="$(memory_size_to_mib "$ORB_MEMORY")" || \
+  orbstack_memory_size_to_mib "$ORB_MEMORY" >/dev/null || \
     fail "ORB_MEMORY must be positive MiB or use an M, MiB, G, or GiB suffix"
-  expected_disk_bytes="$(disk_size_to_bytes "$ORB_DISK")" || \
+  orbstack_disk_size_to_bytes "$ORB_DISK" >/dev/null || \
     fail "ORB_DISK must be positive GiB or use a G or GiB suffix"
 }
 
-machine_property() {
-  local property_path="$1"
-  printf '%s' "$machine_info" | plutil -extract "$property_path" raw -o - -- - 2>/dev/null
-}
+initialize_guest_runtime_paths() {
+  local runtime_path
+  guest_runtime_paths=(
+    provision-box.sh
+    install-runners.sh
+    uninstall-runners.sh
+    provision-postgres.sh
+    lib/github-target.sh
+    lib/orbstack-machine.sh
+  )
 
-require_machine_property() {
-  local property_path="$1" expected_value="$2" setting_name="$3" actual_value
-  actual_value="$(machine_property "$property_path")" || \
-    fail "could not read $setting_name from OrbStack metadata for '$ORB_MACHINE'"
-  [ "$actual_value" = "$expected_value" ] || \
-    fail "existing machine '$ORB_MACHINE' has $setting_name '$actual_value'; expected '$expected_value'. Delete or rename that machine, then rerun this script"
+  if [ -e "$repo_dir/config.env" ] || [ -L "$repo_dir/config.env" ]; then
+    [ -f "$repo_dir/config.env" ] && [ ! -L "$repo_dir/config.env" ] || \
+      fail "config.env must be a regular, non-symlink file"
+    guest_runtime_paths+=(config.env)
+  fi
+
+  for runtime_path in "${guest_runtime_paths[@]}"; do
+    [ -f "$repo_dir/$runtime_path" ] && [ ! -L "$repo_dir/$runtime_path" ] || \
+      fail "required guest runtime file is missing or symlinked: $runtime_path"
+    case "$runtime_path" in
+      lib/*|config.env) ;;
+      *) [ -x "$repo_dir/$runtime_path" ] || fail "guest runtime script is not executable: $runtime_path" ;;
+    esac
+  done
 }
 
 validate_existing_machine() {
-  machine_info="$(orbctl info "$ORB_MACHINE" --format json)" || \
-    fail "could not inspect existing OrbStack machine '$ORB_MACHINE'"
-
-  require_machine_property record.image.distro ubuntu distro
-  require_machine_property record.image.version noble "Ubuntu version"
-  require_machine_property record.image.arch arm64 architecture
-  require_machine_property record.config.isolated true isolation
-  require_machine_property record.config.isolate_network true "network isolation"
-  require_machine_property record.config.default_username "$RUNNER_USER" "default username"
-  require_machine_property record.config.cpu_limit "$ORB_CPUS" "CPU limit"
-  require_machine_property record.config.memory_limit_mib "$expected_memory_mib" "memory limit in MiB"
-  require_machine_property record.config.disk_limit_bytes "$expected_disk_bytes" "disk limit in bytes"
+  orbstack_validate_machine 1 || \
+    fail "existing machine '$ORB_MACHINE' is incompatible; choose a new name or correct its settings"
 }
 
 wait_until_ready() {
@@ -112,48 +96,53 @@ wait_until_ready() {
   fail "machine '$ORB_MACHINE' did not become reachable within 180 seconds"
 }
 
-copy_repository() {
-  repository_archive_path="$(mktemp "${TMPDIR:-/tmp}/little-ci.XXXXXX.tar.gz")"
-  trap cleanup_repository_archive EXIT HUP INT TERM
+copy_guest_runtime() {
+  guest_runtime_archive_path="$(mktemp "${TMPDIR:-/tmp}/little-ci.XXXXXX.tar.gz")"
+  trap cleanup_guest_runtime_archive EXIT HUP INT TERM
 
-  echo "== copying Little-CI to $ORB_MACHINE:$remote_repo_dir =="
+  echo "== copying Little-CI guest runtime to $ORB_MACHINE:$remote_repo_dir =="
+  tar -C "$repo_dir" -czf "$guest_runtime_archive_path" "${guest_runtime_paths[@]}"
   orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" mkdir -p "$remote_repo_dir"
-  tar -C "$repo_dir" --exclude .git --exclude 'actions-runner*' --exclude '*.tar.gz' -czf "$repository_archive_path" .
   # Isolated machines have no Mac bind mount, so stream the archive over stdin.
-  orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" bash -lc \
-    "cat > /tmp/little-ci.tar.gz" < "$repository_archive_path"
-  orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" tar -xzf /tmp/little-ci.tar.gz -C "$remote_repo_dir"
-  orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" rm -f /tmp/little-ci.tar.gz
+  orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" \
+    tar -xzf - -C "$remote_repo_dir" < "$guest_runtime_archive_path"
 
-  cleanup_repository_archive
-  repository_archive_path=""
+  cleanup_guest_runtime_archive
+  guest_runtime_archive_path=""
   trap - EXIT HUP INT TERM
 }
 
 main() {
-  local machine_names
+  local machine_names machine_was_created
   repo_dir="$(cd "$(dirname "$0")" && pwd)"
-  [ -f "$repo_dir/lib/github-target.sh" ] || fail "missing $repo_dir/lib/github-target.sh"
+  guest_runtime_paths=()
+  initialize_guest_runtime_paths
   . "$repo_dir/lib/github-target.sh"
+  . "$repo_dir/lib/orbstack-machine.sh"
   reject_persisted_github_credentials "$repo_dir/config.env" || exit 1
   [ -f "$repo_dir/config.env" ] && . "$repo_dir/config.env"
 
-  github_target_init
   RUNNER_USER="${RUNNER_USER:-deploy}"
-  RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-little-ci-${GITHUB_TARGET//\//-}}"
-  ORB_MACHINE="${ORB_MACHINE:-$RUNNER_NAME_PREFIX}"
+  github_target_init
+  require_apple_silicon_mac
+  github_fleet_init
+  if [ -z "${ORB_MACHINE:-}" ]; then
+    case "$RUNNER_NAME_PREFIX" in
+      *[A-Z]*)
+        fail "set ORB_MACHINE explicitly when an overridden RUNNER_NAME_PREFIX contains uppercase letters"
+        ;;
+    esac
+    ORB_MACHINE="$RUNNER_NAME_PREFIX"
+  fi
   ORB_CPUS="${ORB_CPUS:-2}"
   ORB_MEMORY="${ORB_MEMORY:-4G}"
   ORB_DISK="${ORB_DISK:-48G}"
   RUNNER_COUNT="${RUNNER_COUNT:-1}"
   RUNNER_HOME="${RUNNER_HOME:-/home/${RUNNER_USER}}"
   remote_repo_dir="$RUNNER_HOME/little-ci"
-  machine_info=""
-  repository_archive_path=""
-  expected_memory_mib=""
-  expected_disk_bytes=""
+  guest_runtime_archive_path=""
+  machine_was_created=0
 
-  require_apple_silicon_mac
   validate_config
 
   machine_names="$(orbctl list -q)" || \
@@ -175,14 +164,28 @@ main() {
       --user "$RUNNER_USER" \
       ubuntu:24.04 \
       "$ORB_MACHINE"
+    machine_was_created=1
   fi
 
   wait_until_ready
+  if [ "$machine_was_created" = 1 ]; then
+    orbstack_validate_machine 1 || \
+      fail "new machine '$ORB_MACHINE' does not match the requested secure configuration"
+    orbstack_write_machine_identity || fail "could not write Little-CI ownership identity"
+    orbstack_verify_machine_identity || fail "could not verify Little-CI ownership identity"
+  else
+    orbstack_verify_machine_identity || \
+      fail "refusing to modify an existing machine without matching Little-CI ownership"
+  fi
 
   echo "== installing base packages and Docker =="
   orbctl run -m "$ORB_MACHINE" -u root bash -s <<'EOF'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+install -d -m 755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/actions_runner_services.conf <<'NEEDRESTART'
+$nrconf{override_rc}{qr(^actions\.runner\..+\.service$)} = 0;
+NEEDRESTART
 apt-get update
 apt-get install -y curl ca-certificates git jq python3 unzip libatomic1
 if ! command -v docker >/dev/null 2>&1; then
@@ -234,10 +237,18 @@ apt-get update
 test -f /etc/apt/sources.list.d/ubuntu.sources
 EOF
 
-  copy_repository
+  copy_guest_runtime
 
   echo "== configuring scratch space and cleanup =="
-  orbctl run -m "$ORB_MACHINE" -u root bash -lc "cd '$remote_repo_dir' && ./provision-box.sh"
+  orbctl run -m "$ORB_MACHINE" -u root env \
+    "GITHUB_SCOPE=$GITHUB_SCOPE" \
+    "GITHUB_URL=$GITHUB_URL" \
+    "RUNNER_GROUP=${RUNNER_GROUP:-}" \
+    "FLEET_ID=${FLEET_ID:-}" \
+    "RUNNER_NAME_PREFIX=$RUNNER_NAME_PREFIX" \
+    "RUNNER_USER=$RUNNER_USER" \
+    "RUNNER_COUNT=$RUNNER_COUNT" \
+    bash -c 'cd "$1" && ./provision-box.sh' bash "$remote_repo_dir"
 
   echo "== $ORB_MACHINE ready =="
   orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" bash -lc \
