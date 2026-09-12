@@ -1,19 +1,27 @@
-# Example: share ONE native Postgres across all CI runs, but give each run its own
-# isolated SCHEMA so runs never collide — sequential or concurrent. Pairs with
+# Example: share ONE native Postgres across all CI jobs, but give each job its own
+# isolated SCHEMA so jobs never collide — sequential, parallel, or matrix. Pairs with
 # provision-postgres.sh (which creates the role+db this assumes: ci/ci on :5432).
 # Generalize the app-specific bits (npm ci / npm test) to your stack.
+#
+# This localhost connection works for steps executed directly on the runner. Inside
+# a job container or service container, 127.0.0.1 is that container, not the runner;
+# use an explicit container-to-host network configuration before adopting this URL.
 name: test
 on: [push, pull_request]
 
 concurrency:
-  # Optional: bound how many test jobs hit the shared box at once. Per-run schemas
-  # already make parallel runs safe; this is about RAM/load, not DB collisions.
-  group: ci-postgres-${{ github.ref }}
+  # Optional load shedding: GitHub keeps at most one running and one pending workflow
+  # per group. This does not set a numeric job limit; remove it to keep every run.
+  group: little-ci-postgres-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   test:
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, little-ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
     env:
       PGHOST: 127.0.0.1        # 127.0.0.1, not localhost — dodges ::1-vs-IPv4 flakiness
       PGPORT: "5432"
@@ -23,7 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Provision isolated per-run schema (+ wait for Postgres)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Provision isolated per-job schema (+ wait for Postgres)
+        env:
+          MATRIX_JOB_INDEX: ${{ strategy.job-index }}
         run: |
           set -euo pipefail
           # Fail fast if Postgres is down/hung rather than hanging the job.
@@ -32,10 +46,13 @@ jobs:
             [ "$i" = 30 ] && { echo "Postgres not ready after 30s"; exit 1; }
             sleep 1
           done
-          SCHEMA="run_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          # Hash the full job identity into a short, valid Postgres identifier.
+          # GITHUB_JOB distinguishes parallel jobs; job-index distinguishes matrix cells.
+          identity="${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${GITHUB_JOB}:${MATRIX_JOB_INDEX}"
+          SCHEMA="ci_$(printf '%s' "$identity" | sha256sum | cut -c1-32)"
           BASE="postgresql://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE"
           psql "$BASE?connect_timeout=5" -v ON_ERROR_STOP=1 \
-            -c "CREATE SCHEMA IF NOT EXISTS \"$SCHEMA\";"
+            -c "CREATE SCHEMA IF NOT EXISTS $SCHEMA;"
           # Point the app at THIS run's schema via search_path in the URL.
           URL="$BASE?options=-csearch_path%3D$SCHEMA&connect_timeout=5"
           {
@@ -49,8 +66,13 @@ jobs:
           npm ci
           npm test
 
-      - name: Drop the per-run schema
-        if: always()   # so a crashed run can't leave schemas piling up in the shared DB
+      - name: Drop the per-job schema
+        if: always()   # so a failed job can't leave schemas piling up in the shared DB
         run: |
+          set -euo pipefail
+          if [[ ! "${RUN_SCHEMA:-}" =~ ^ci_[0-9a-f]{32}$ ]]; then
+            echo "No valid job schema was created; skipping cleanup"
+            exit 0
+          fi
           psql "postgresql://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE?connect_timeout=5" \
-            -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS \"$RUN_SCHEMA\" CASCADE;" || true
+            -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS $RUN_SCHEMA CASCADE;"
