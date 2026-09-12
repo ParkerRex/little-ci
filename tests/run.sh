@@ -241,7 +241,7 @@ case "${1:-}" in
     drop_in_dir="/etc/systemd/system/${MOCK_SERVICE_NAME:?}.d"
     drop_in_file="$drop_in_dir/zz-little-ci-scratch.conf"
     case "${2:-}:${3:-}" in
-      -f:/etc/systemd/system/"$MOCK_SERVICE_NAME") exit 0 ;;
+      -f:/etc/systemd/system/"$MOCK_SERVICE_NAME") [ "${MOCK_SERVICE_UNIT_EXISTS:-1}" = 1 ] || [ -f "${MOCK_SERVICE_REINSTALLED_STORE:-/nonexistent}" ] ;;
       -L:"$drop_in_dir") [ "${MOCK_DROP_IN_SYMLINK:-none}" = dir ] ;;
       -L:"$drop_in_file") [ "${MOCK_DROP_IN_SYMLINK:-none}" = file ] ;;
       -e:"$drop_in_dir"|-d:"$drop_in_dir") [ "${MOCK_DROP_IN_STATE:-missing}" != missing ] || [ "${MOCK_DROP_IN_SYMLINK:-none}" = dir ] ;;
@@ -277,7 +277,14 @@ case "${1:-}" in
       exit 0
     fi
     ;;
-  install|./svc.sh) exit 0 ;;
+  ./svc.sh)
+    if [ "${2:-}" = install ]; then
+      : > "${MOCK_SERVICE_REINSTALLED_STORE:?}"
+      printf '%s\n' "${MOCK_SERVICE_NAME:?}" > "${MOCK_RUNNER_DIR:?}/.service"
+    fi
+    exit 0
+    ;;
+  install) exit 0 ;;
   *) exit 1 ;;
 esac
 MOCK
@@ -1264,6 +1271,49 @@ test_inactive_service_repairs_scratch_drop_in_then_starts() {
   assert_contains "$output" 'existing local registration retained'
 }
 
+test_missing_inactive_service_unit_is_reinstalled_safely() {
+  new_sandbox
+  install_runner_user_id_mock
+  local runner_prefix=little-ci-acme-widget-studio
+  local service_name=actions.runner.acme-widget.little-ci-acme-widget-studio-1.service
+  local runner_dir="$sandbox_dir/runner-home/actions-runner-1"
+  create_existing_runner_fixture "$runner_prefix-1" "$service_name"
+  install_service_command_mocks
+
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_RUNNER_DIR="$runner_dir" \
+      MOCK_RUNNER_USER=deploy \
+      MOCK_RUNNER_PREFIX="$runner_prefix" \
+      MOCK_SERVICE_NAME="$service_name" \
+      MOCK_SERVICE_UNIT_EXISTS=0 \
+      MOCK_SERVICE_ACTIVE=0 \
+      MOCK_SERVICE_REINSTALLED_STORE="$sandbox_dir/service-reinstalled" \
+      MOCK_DROP_IN_STATE=unchanged \
+      MOCK_TEE_OUTPUT="$sandbox_dir/drop-in.conf" \
+      GITHUB_SCOPE=repository \
+      GITHUB_URL=https://github.com/acme/widget \
+      FLEET_ID=studio \
+      REGTOKEN=unused-registration-token \
+      RUNNER_HOME="$sandbox_dir/runner-home" \
+      RUNNER_USER=deploy \
+      RUNNER_ARCH=linux-arm64 \
+      ./install-runners.sh 2>&1
+  )"
+  status=$?
+  set -e
+  assert_status 0 "$status"
+  assert_file_contains "$sandbox_dir/command.log" 'sudo systemctl is-active --quiet'
+  assert_file_contains "$sandbox_dir/command.log" 'sudo ./svc.sh install deploy'
+  assert_file_contains "$sandbox_dir/command.log" 'sudo ./svc.sh start'
+  assert_file_order "$sandbox_dir/command.log" 'sudo ./svc.sh install deploy' 'sudo ./svc.sh start'
+  assert_contains "$output" 'existing local registration retained'
+}
+
 test_mismatched_service_unit_blocks_scratch_and_start() {
   new_sandbox
   install_runner_user_id_mock
@@ -1403,6 +1453,113 @@ MOCK
   [ "$(cat "$manifest_path")" = $'1\t/swapfile-little-ci-acme-widget-studio-1' ] || fail 'unsafe manifest state was modified'
 }
 
+test_commented_fstab_swap_entry_is_not_active_configuration() {
+  new_sandbox
+  printf '# /swapfile-little-ci-acme-widget-studio-1 none swap sw 0 0\n' > "$sandbox_dir/fstab"
+  cat > "$sandbox_dir/bin/awk" <<'MOCK'
+#!/usr/bin/env bash
+last_argument="${!#}"
+if [ "$last_argument" = /etc/fstab ]; then
+  arguments=("$@")
+  arguments[$(($# - 1))]="${MOCK_FSTAB:?}"
+  exec /usr/bin/awk "${arguments[@]}"
+fi
+exec /usr/bin/awk "$@"
+MOCK
+  chmod +x "$sandbox_dir/bin/awk"
+
+  local commented_status active_status
+  set +e
+  (
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" MOCK_FSTAB="$sandbox_dir/fstab" \
+      bash -c '. ./provision-box.sh; fstab_has_exact_swap_entry /swapfile-little-ci-acme-widget-studio-1'
+  )
+  commented_status=$?
+  printf '/swapfile-little-ci-acme-widget-studio-1 none swap sw 0 0\n' >> "$sandbox_dir/fstab"
+  (
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" MOCK_FSTAB="$sandbox_dir/fstab" \
+      bash -c '. ./provision-box.sh; fstab_has_exact_swap_entry /swapfile-little-ci-acme-widget-studio-1'
+  )
+  active_status=$?
+  set -e
+  [ "$commented_status" -ne 0 ] || fail 'commented fstab row counted as active swap configuration'
+  assert_status 0 "$active_status"
+}
+
+test_existing_unowned_fleet_swapfile_is_rejected() {
+  new_sandbox
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" && bash -c '
+      . ./provision-box.sh
+      swap_ownership_manifest="$1"
+      SWAP_GB=10
+      validate_owned_swapfile 1 /swapfile-little-ci-acme-widget-studio-1
+    ' bash "$sandbox_dir/missing-managed-swapfiles" 2>&1
+  )"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail 'unowned fleet swapfile unexpectedly accepted'
+  assert_contains "$output" 'refusing existing unowned Little-CI swapfile'
+}
+
+test_legacy_swapoff_failure_preserves_file_and_fstab() {
+  new_sandbox
+  mkdir -p "$sandbox_dir/orbstack-guest"
+  cat > "$sandbox_dir/bin/id" <<'MOCK'
+#!/usr/bin/env bash
+[ "${1:-}" = -u ] && { printf '0\n'; exit 0; }
+/usr/bin/id "$@"
+MOCK
+  cat > "$sandbox_dir/bin/awk" <<'MOCK'
+#!/usr/bin/env bash
+printf '/swapfile1\n'
+MOCK
+  cat > "$sandbox_dir/bin/swapon" <<'MOCK'
+#!/usr/bin/env bash
+printf 'swapon %s\n' "$*" >> "${MOCK_COMMAND_LOG:?}"
+if [ "${1:-}" = --show=NAME ]; then printf '/swapfile1\n'; fi
+MOCK
+  cat > "$sandbox_dir/bin/swapoff" <<'MOCK'
+#!/usr/bin/env bash
+printf 'swapoff %s\n' "$*" >> "${MOCK_COMMAND_LOG:?}"
+exit 1
+MOCK
+  for command_name in mktemp mv rm; do
+    cat > "$sandbox_dir/bin/$command_name" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >> "${MOCK_COMMAND_LOG:?}"
+exit 74
+MOCK
+    chmod +x "$sandbox_dir/bin/$command_name"
+  done
+  chmod +x "$sandbox_dir/bin/id" "$sandbox_dir/bin/awk" "$sandbox_dir/bin/swapon" "$sandbox_dir/bin/swapoff"
+
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      LITTLE_CI_ORBSTACK_GUEST_MARKER="$sandbox_dir/orbstack-guest" \
+      GITHUB_SCOPE=repository \
+      GITHUB_URL=https://github.com/acme/widget \
+      FLEET_ID=studio \
+      REMOVE_LEGACY_SWAPFILES=1 \
+      ./provision-box.sh 2>&1
+  )"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail 'legacy swapoff failure unexpectedly reported success'
+  assert_contains "$output" 'preserving fstab and files: /swapfile1'
+  assert_file_contains "$sandbox_dir/command.log" 'swapoff /swapfile1'
+  assert_file_not_contains "$sandbox_dir/command.log" 'mv '
+  assert_file_not_contains "$sandbox_dir/command.log" 'rm -f -- /swapfile1'
+}
+
 test_config_file_rejects_persisted_tokens_without_leaking_value() {
   new_sandbox
   printf '%s\n' \
@@ -1516,6 +1673,51 @@ test_doctor_always_requires_stable_little_ci_label() {
   assert_contains "$output" 'missing required labels little-ci'
 }
 
+test_doctor_org_membership_handles_large_runner_payload() {
+  new_sandbox
+  install_uname_mock arm64
+  install_orbctl_machine_mock
+  awk 'BEGIN {
+    printf "[{\"runners\":[{\"id\":41,\"name\":\"little-ci-acme-studio-1\",\"status\":\"online\",\"labels\":[{\"name\":\"little-ci\"},{\"name\":\"little-ci-acme-studio\"},{\"name\":\"little-ci-acme-studio-1\"},{\"name\":\"arm64\"}]}"
+    for (filler_index = 1; filler_index <= 30000; filler_index++) printf ", {\"id\":%d,\"name\":\"unrelated-runner-%d\",\"status\":\"offline\",\"labels\":[]}", filler_index + 100, filler_index
+    printf "]}]"
+  }' > "$sandbox_dir/large-runners.json"
+  cat > "$sandbox_dir/bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >> "${MOCK_COMMAND_LOG:?}"
+case "$*" in
+  *'/runner-groups/7/runners?'*) printf '[{"runners":[{"id":41,"name":"little-ci-acme-studio-1"}]}]\n' ;;
+  *'/runner-groups?'*) printf '[{"runner_groups":[{"id":7,"name":"trusted-macs"}]}]\n' ;;
+  *'/actions/runners?'*) cat "${MOCK_LARGE_RUNNERS_FILE:?}" ;;
+  *) exit 1 ;;
+esac
+MOCK
+  chmod +x "$sandbox_dir/bin/gh"
+
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_LARGE_RUNNERS_FILE="$sandbox_dir/large-runners.json" \
+      MOCK_ORB_INFO='{"record":{"name":"little-ci-acme-studio","state":"running","image":{"distro":"ubuntu","version":"noble","arch":"arm64"},"config":{"isolated":true,"isolate_network":true,"forward_ssh_agent":false,"default_username":"deploy","cpu_limit":2,"memory_limit_mib":4096,"disk_limit_bytes":51539607552}}}' \
+      MOCK_ORB_IDENTITY=$'machine=little-ci-acme-studio\nscope=organization\ntarget=acme\nprefix=little-ci-acme-studio\nuser=deploy\nhome=/home/deploy' \
+      GITHUB_SCOPE=organization \
+      GITHUB_URL=https://github.com/acme \
+      FLEET_ID=studio \
+      RUNNER_GROUP=trusted-macs \
+      ./doctor.sh 2>&1
+  )"
+  status=$?
+  set -e
+  assert_contains "$output" 'little-ci-acme-studio-1 belongs to the configured organization runner group'
+  case "$output" in
+    *'argument list too long'*|*'membership is unreadable'*) fail 'large runner payload crossed process argv boundary' ;;
+  esac
+  [ "$status" -ne 126 ] || fail 'doctor hit operating-system argument limit'
+}
+
 test_orbstack_uninstall_forwards_remove_token_and_cleans_matching_stale_runner() {
   new_sandbox
   install_gh_mock
@@ -1572,6 +1774,40 @@ test_machine_deletion_requires_all_mode() {
   assert_status 2 "$status"
   assert_contains "$output" 'allowed only with --all'
   [ ! -s "$sandbox_dir/command.log" ] || fail 'external commands ran before delete-mode validation'
+}
+
+test_untrusted_guest_teardown_script_blocks_before_external_calls() {
+  local script_state="$1"
+  new_sandbox
+  install_uname_mock arm64
+  install_gh_mock
+  install_orbctl_machine_mock
+  case "$script_state" in
+    missing) /bin/rm -f "$sandbox_dir/repo/uninstall-runners.sh" ;;
+    unreadable) chmod 000 "$sandbox_dir/repo/uninstall-runners.sh" ;;
+    symlink)
+      /bin/mv "$sandbox_dir/repo/uninstall-runners.sh" "$sandbox_dir/repo/uninstall-runners.real.sh"
+      /bin/ln -s uninstall-runners.real.sh "$sandbox_dir/repo/uninstall-runners.sh"
+      ;;
+    *) fail "unsupported teardown script fixture: $script_state" ;;
+  esac
+
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      GITHUB_SCOPE=repository \
+      GITHUB_URL=https://github.com/acme/widget \
+      FLEET_ID=studio \
+      ./uninstall-runners-orb.sh --all --confirm --delete-machine 2>&1
+  )"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "$script_state teardown script unexpectedly accepted"
+  assert_contains "$output" 'required teardown script is missing, unreadable, or symlinked'
+  [ ! -s "$sandbox_dir/command.log" ] || fail 'external call occurred before teardown-script validation'
 }
 
 test_orbstack_uninstall_rejects_markerless_machine_before_github() {
@@ -1891,6 +2127,9 @@ test_orbstack_install_fetches_registration_token_and_splits_service_install() {
   assert_file_contains "$sandbox_dir/command.log" 'ORBENV=REGTOKEN'
   assert_file_contains "$sandbox_dir/command.log" 'RUNNER_ARCH=linux-arm64\ SKIP_SERVICE_INSTALL=1\ ./install-runners.sh'
   assert_file_contains "$sandbox_dir/command.log" '-u root'
+  assert_file_contains "$sandbox_dir/command.log" 'systemctl is-active --quiet'
+  assert_file_contains "$sandbox_dir/command.log" 'rm -f -- .service'
+  assert_file_contains "$sandbox_dir/command.log" './svc.sh install'
   assert_file_contains "$sandbox_dir/command.log" './svc.sh start'
   case "$output$(cat "$sandbox_dir/command.log")" in
     *do-not-log-registration-token*) fail 'registration token leaked to output or command log' ;;
@@ -2468,15 +2707,23 @@ run_case 'active service rejects changed scratch drop-in' test_active_service_dr
 run_case 'service drop-in directory symlink is rejected before write' test_service_drop_in_symlink_is_rejected_before_write dir
 run_case 'service drop-in file symlink is rejected before write' test_service_drop_in_symlink_is_rejected_before_write file
 run_case 'inactive service repairs scratch drop-in before start' test_inactive_service_repairs_scratch_drop_in_then_starts
+run_case 'missing inactive service unit is reinstalled safely' test_missing_inactive_service_unit_is_reinstalled_safely
 run_case 'mismatched service unit blocks scratch and start' test_mismatched_service_unit_blocks_scratch_and_start
 run_case 'legacy OrbStack swapfile cleanup is opt in' test_legacy_swapfile_cleanup_is_opt_in
 run_case 'swap manifest records exact owned path and requires root-restricted state' test_swap_manifest_records_exact_owned_path_and_rejects_unsafe_permissions
+run_case 'commented fstab swap entry is ignored' test_commented_fstab_swap_entry_is_not_active_configuration
+run_case 'existing unowned fleet swapfile is rejected' test_existing_unowned_fleet_swapfile_is_rejected
+run_case 'legacy swapoff failure preserves file and fstab' test_legacy_swapoff_failure_preserves_file_and_fstab
 run_case 'config.env rejects persisted tokens without leaking them' test_config_file_rejects_persisted_tokens_without_leaking_value
 run_case 'doctor reports missing configured runner label' test_doctor_reports_missing_configured_runner_label
 run_case 'doctor requires exact runner-name and arm64 labels' test_doctor_requires_exact_runner_name_and_arm64_labels
 run_case 'doctor always requires stable little-ci label' test_doctor_always_requires_stable_little_ci_label
+run_case 'doctor org membership handles large runner payload' test_doctor_org_membership_handles_large_runner_payload
 run_case 'OrbStack uninstall forwards remove token and deletes only matching stale runner' test_orbstack_uninstall_forwards_remove_token_and_cleans_matching_stale_runner
 run_case 'OrbStack machine deletion requires all mode' test_machine_deletion_requires_all_mode
+run_case 'missing teardown script blocks before external calls' test_untrusted_guest_teardown_script_blocks_before_external_calls missing
+run_case 'unreadable teardown script blocks before external calls' test_untrusted_guest_teardown_script_blocks_before_external_calls unreadable
+run_case 'symlinked teardown script blocks before external calls' test_untrusted_guest_teardown_script_blocks_before_external_calls symlink
 run_case 'OrbStack uninstall rejects markerless machine before GitHub' test_orbstack_uninstall_rejects_markerless_machine_before_github
 run_case 'OrbStack uninstall rejects mismatched identity before GitHub' test_orbstack_uninstall_rejects_mismatched_identity_before_github
 run_case 'OrbStack uninstall reports recovery after guest failure without deleting' test_orbstack_uninstall_guest_failure_reports_recovery_without_deleting
