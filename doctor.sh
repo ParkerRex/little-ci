@@ -164,8 +164,8 @@ for index in range(1, count + 1):
     if runner is None:
         print("FAIL\t%s is not registered with GitHub" % name)
         continue
-    labels = {label.get("name") for label in runner.get("labels", [])}
-    if prefix not in labels:
+    labels = {str(label.get("name", "")).casefold() for label in runner.get("labels", [])}
+    if prefix.casefold() not in labels:
         print("FAIL\t%s is missing fleet label %s" % (name, prefix))
     elif runner.get("status") != "online":
         print("FAIL\t%s is %s on GitHub" % (name, runner.get("status", "unknown")))
@@ -174,8 +174,8 @@ for index in range(1, count + 1):
         print("PASS\t%s is online%s on GitHub" % (name, busy))
 for runner in runners:
     match = pattern.match(runner.get("name", ""))
-    labels = {label.get("name") for label in runner.get("labels", [])}
-    if match and prefix in labels and int(match.group(1)) > count:
+    labels = {str(label.get("name", "")).casefold() for label in runner.get("labels", [])}
+    if match and prefix.casefold() in labels and int(match.group(1)) > count:
         print("WARN\t%s is outside RUNNER_COUNT=%d (%s)" % (runner["name"], count, runner.get("status", "unknown")))
 ' "$RUNNER_NAME_PREFIX" "$RUNNER_COUNT" 2>/dev/null || true)"
     if [ -z "$github_report" ]; then

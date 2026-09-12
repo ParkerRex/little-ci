@@ -138,11 +138,12 @@ import json, re, sys
 prefix, mode, count, exact_name = sys.argv[1:]
 pages = json.load(sys.stdin)
 pattern = re.compile(r"^" + re.escape(prefix) + r"-([1-9][0-9]*)$")
+prefix_ci = prefix.casefold()
 for page in pages:
     for runner in page.get("runners", []):
         match = pattern.match(runner.get("name", ""))
-        labels = {label.get("name") for label in runner.get("labels", [])}
-        if not match or prefix not in labels:
+        labels = {str(label.get("name", "")).casefold() for label in runner.get("labels", [])}
+        if not match or prefix_ci not in labels:
             continue
         index = int(match.group(1))
         selected = mode == "all" or (mode == "prune" and index > int(count)) or (mode == "runner" and runner["name"] == exact_name)
