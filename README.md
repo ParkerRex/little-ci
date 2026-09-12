@@ -47,7 +47,7 @@ For a generic Linux host, use Ubuntu 24.04 with systemd, a non-root runner user,
 Clone Little-CI and create the local configuration:
 
 ```bash
-git clone https://github.com/ParkerRex/Little-CI.git
+git clone https://github.com/ParkerRex/little-ci.git
 cd Little-CI
 cp config.env.example config.env
 $EDITOR config.env
