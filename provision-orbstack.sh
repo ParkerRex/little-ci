@@ -180,6 +180,170 @@ main() {
       fail "refusing to modify an existing machine without matching Little-CI ownership"
   fi
 
+  # Some workflows expect Ubuntu's deb822 source file. OrbStack's image may
+  # still ship the classic /etc/apt/sources.list instead. CI job dependencies
+  # come from universe, so verified Ubuntu archives in an existing ubuntu.sources
+  # gain that component in place; other fields and sources are preserved. The LITTLE_CI_APT_*
+  # paths are test hooks only; orbctl does not forward Mac environment. This runs
+  # before any guest apt use so malformed sources stop provisioning first.
+  echo "== ensuring Ubuntu deb822 package sources =="
+  orbctl run -m "$ORB_MACHINE" -u root bash -s <<'EOF'
+set -euo pipefail
+apt_sources_dir="${LITTLE_CI_APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+apt_sources_list="${LITTLE_CI_APT_SOURCES_LIST:-/etc/apt/sources.list}"
+ubuntu_sources="$apt_sources_dir/ubuntu.sources"
+
+# Print "changed" or "unchanged"; with a second path, write the updated file
+# there. Exits nonzero without output on malformed deb822. POSIX awk only:
+# this runs before base packages, so python3 may not exist yet.
+add_universe_component() {
+  awk -v sources_path="$1" -v updated_path="${2:-}" -v q="'" '
+    function reject(reason) {
+      printf "ERROR: %s: %s; fix it before provisioning\n", sources_path, reason > "/dev/stderr"
+      failed = 1
+      exit 1
+    }
+    function has_universe(value,   parts, count, i) {
+      count = split(value, parts, /[[:space:]]+/)
+      for (i = 1; i <= count; i++) if (parts[i] == "universe") return 1
+      return 0
+    }
+    function lacks(field_name) {
+      return fields[field_name] !~ /[^[:space:]]/
+    }
+    # Mirrors apt 2.7 deb822 rules: every stanza needs a Types field limited to
+    # deb and deb-src; empty Types or false Enabled make a stanza inert;
+    # enabled stanzas need URIs that each contain ":" and Suites; exact-path
+    # Suites (ending in /) must omit Components, other Suites require it, and
+    # one stanza cannot mix the two.
+    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count, ubuntu_archive, archive_uri, archive_authority) {
+      if (!in_stanza) return
+      if (!("types" in fields)) reject("deb822 stanza at line " stanza_start " lacks Types")
+      count = split(fields["types"], types, /[[:space:]]+/)
+      for (i = 1; i <= count; i++)
+        if (types[i] != "" && types[i] != "deb" && types[i] != "deb-src")
+          reject("deb822 stanza at line " stanza_start " has unknown Types value " q types[i] q)
+      enabled = tolower(fields["enabled"])
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", enabled)
+      # apt StringToBool: false words, or a whole value strtol(..., 0) reads
+      # as zero (octal, 0x hex, or Ubuntu 24.04 glibc 0b binary; optional sign).
+      if (!lacks("types") && enabled !~ /^([+-]?(0+|0x0+|0b0+)|no|false|without|off|disable)$/) {
+        if (lacks("uris")) reject("deb822 stanza at line " stanza_start " lacks URIs")
+        if (lacks("suites")) reject("deb822 stanza at line " stanza_start " lacks Suites")
+        count = split(fields["uris"], uris, /[[:space:]]+/)
+        ubuntu_archive = 1
+        for (i = 1; i <= count; i++) {
+          if (uris[i] == "") continue
+          if (index(uris[i], ":") == 0)
+            reject("deb822 stanza at line " stanza_start " has URI " q uris[i] q " without " q ":" q)
+          # Every URI must name a known Ubuntu archive. Custom mirrors and
+          # mixed Ubuntu/third-party stanzas retain their original components.
+          # Normalize scheme/authority only for comparison; preserve path case and text.
+          archive_uri = uris[i]
+          if (match(tolower(archive_uri), /^https?:\/\/[^\/]+/)) {
+            archive_authority = tolower(substr(archive_uri, 1, RLENGTH))
+            if (archive_authority ~ /^http:\/\//) sub(/:80$/, "", archive_authority)
+            else sub(/:443$/, "", archive_authority)
+            sub(/\.$/, "", archive_authority)
+            archive_uri = archive_authority substr(archive_uri, RLENGTH + 1)
+          }
+          if (archive_uri !~ /^https?:\/\/((archive|security)\.ubuntu\.com\/ubuntu|ports\.ubuntu\.com\/ubuntu-ports)\/?$/)
+            ubuntu_archive = 0
+        }
+        count = split(fields["suites"], suites, /[[:space:]]+/)
+        suite_count = exact_count = 0
+        for (i = 1; i <= count; i++) {
+          if (suites[i] == "") continue
+          suite_count++
+          if (suites[i] ~ /\/$/) exact_count++
+        }
+        if (exact_count > 0 && exact_count < suite_count)
+          reject("deb822 stanza at line " stanza_start " mixes exact-path and archive Suites")
+        if (exact_count > 0 && !lacks("components"))
+          reject("deb822 stanza at line " stanza_start " has exact-path Suites; exact-path Suites must omit Components")
+        if (exact_count == 0 && lacks("components"))
+          reject("deb822 stanza at line " stanza_start " lacks Components")
+        # Continued Components values were accumulated above; append to the
+        # first Components line so continuation lines stay byte-identical.
+        if (exact_count == 0 && ubuntu_archive && !has_universe(fields["components"])) {
+          sub(/[[:space:]]+$/, "", lines[components_line])
+          lines[components_line] = lines[components_line] " universe"
+          changed = 1
+        }
+      }
+      in_stanza = 0
+      current_field = ""
+      split("", fields)
+    }
+    { lines[NR] = $0 }
+    /^[[:space:]]*$/ { finish_stanza(); next }
+    /^#/ { next }
+    /^[ \t]/ {
+      if (!in_stanza) next
+      if (current_field == "") reject("malformed deb822 continuation at line " NR)
+      fields[current_field] = fields[current_field] " " $0
+      next
+    }
+    {
+      separator = index($0, ":")
+      if (separator < 2) reject("malformed deb822 field at line " NR)
+      field_name = tolower(substr($0, 1, separator - 1))
+      sub(/[[:space:]]+$/, "", field_name)
+      # Like apt, a repeated field replaces the earlier one (with its
+      # continuations); earlier lines are left byte-identical.
+      fields[field_name] = substr($0, separator + 1)
+      current_field = field_name
+      if (!in_stanza) { in_stanza = 1; stanza_start = NR }
+      if (field_name == "components") components_line = NR
+    }
+    END {
+      if (failed) exit 1
+      finish_stanza()
+      if (changed && updated_path != "")
+        for (i = 1; i <= NR; i++) print lines[i] > updated_path
+      print (changed ? "changed" : "unchanged")
+    }
+  ' "$1"
+}
+
+if [ "$(dpkg --print-architecture)" != arm64 ]; then
+  echo "ERROR: Little-CI OrbStack guest must use arm64" >&2
+  exit 1
+fi
+if [ ! -e "$ubuntu_sources" ] && [ ! -L "$ubuntu_sources" ]; then
+  cat > "$ubuntu_sources" <<'SOURCES'
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: noble noble-updates noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+fi
+if [ ! -f "$ubuntu_sources" ] || [ -L "$ubuntu_sources" ] || [ ! -r "$ubuntu_sources" ]; then
+  echo "ERROR: $ubuntu_sources is not a readable regular file" >&2
+  exit 1
+fi
+
+updated_sources="$(mktemp "$apt_sources_dir/.ubuntu.sources.little-ci.XXXXXX")"
+trap 'rm -f -- "$updated_sources"' EXIT
+sources_state="$(add_universe_component "$ubuntu_sources" "$updated_sources")"
+if [ "$sources_state" = changed ]; then
+  chown --reference="$ubuntu_sources" "$updated_sources"
+  chmod --reference="$ubuntu_sources" "$updated_sources"
+  mv -- "$updated_sources" "$ubuntu_sources"
+  echo "enabled universe in $ubuntu_sources"
+fi
+rm -f -- "$updated_sources"
+trap - EXIT
+[ "$(add_universe_component "$ubuntu_sources")" = unchanged ] || {
+  echo "ERROR: universe is still missing from $ubuntu_sources" >&2
+  exit 1
+}
+
+# An existing deb822 file may contain no active Ubuntu binary archive.
+# Preserve the classic list, which may still be the machine's only source.
+EOF
+
   echo "== installing base packages and Docker =="
   orbctl run -m "$ORB_MACHINE" -u root bash -s <<'EOF'
 set -euo pipefail
@@ -211,32 +375,6 @@ for sudoers_path in "/etc/sudoers.d/$runner_user" /etc/sudoers.d/orbstack; do
     echo "WARN: preserving unexpected sudoers content in $sudoers_path" >&2
   fi
 done
-EOF
-
-  # Some workflows expect Ubuntu's deb822 source file. OrbStack's image may
-  # still ship the classic /etc/apt/sources.list instead.
-  echo "== ensuring Ubuntu deb822 package sources =="
-  orbctl run -m "$ORB_MACHINE" -u root bash -s <<'EOF'
-set -euo pipefail
-if [ "$(dpkg --print-architecture)" != arm64 ]; then
-  echo "ERROR: Little-CI OrbStack guest must use arm64" >&2
-  exit 1
-fi
-if [ ! -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-  cat > /etc/apt/sources.list.d/ubuntu.sources <<'SOURCES'
-Types: deb
-URIs: http://ports.ubuntu.com/ubuntu-ports
-Suites: noble noble-updates noble-security
-Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-SOURCES
-fi
-if [ -s /etc/apt/sources.list ]; then
-  mv /etc/apt/sources.list /etc/apt/sources.list.distrobuilder.bak
-  : > /etc/apt/sources.list
-fi
-apt-get update
-test -f /etc/apt/sources.list.d/ubuntu.sources
 EOF
 
   copy_guest_runtime

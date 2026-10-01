@@ -209,6 +209,17 @@ case "${1:-}" in
       *" id -u "*) printf '%s\n' "${MOCK_GUEST_UID:-1000}" ;;
       *" uname -m "*) printf 'aarch64\n' ;;
     esac
+    if [ "${MOCK_EXECUTE_GUEST_APT_SOURCES:-0}" = 1 ] && [ "$#" -eq 7 ] && [[ " $* " == *" -u root bash -s "* ]]; then
+      guest_script="$(cat)"
+      [ -z "${MOCK_ORBCTL_STDIN_LOG:-}" ] || printf '%s\n' "$guest_script" >> "$MOCK_ORBCTL_STDIN_LOG"
+      if [[ "$guest_script" == *ubuntu.sources* ]]; then
+        printf 'guest-script ubuntu.sources\n' >> "$MOCK_COMMAND_LOG"
+        /bin/bash -s <<< "$guest_script"
+        exit $?
+      fi
+      [[ "$guest_script" != *apt-get* ]] || printf 'guest-script apt-get (not executed)\n' >> "$MOCK_COMMAND_LOG"
+      exit "${MOCK_ORBCTL_STATUS:-0}"
+    fi
     if [ -n "${MOCK_ORBCTL_STDIN_LOG:-}" ] && [[ " $* " == *" bash -s "* ]]; then
       cat >> "$MOCK_ORBCTL_STDIN_LOG"
       printf '\n' >> "$MOCK_ORBCTL_STDIN_LOG"
@@ -2554,6 +2565,319 @@ CONFIG
   esac
 }
 
+write_main_only_ubuntu_sources() {
+  cat > "$1" <<'SOURCES'
+# Ubuntu sources have moved to /etc/apt/sources.list.d/ubuntu.sources
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports/
+Suites: noble noble-updates noble-backports
+Components: main
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports/
+Suites: noble-security
+Components: main restricted
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+}
+
+test_orbstack_enables_universe_in_existing_deb822_sources() {
+  local source_state="$1" expected_message="${2:-}"
+  new_sandbox
+  install_uname_mock arm64
+  install_orbctl_machine_mock
+  mkdir -p "$sandbox_dir/apt/sources.list.d"
+  printf 'deb http://ports.ubuntu.com/ubuntu-ports noble main universe\n' > "$sandbox_dir/apt/sources.list"
+  cp "$sandbox_dir/apt/sources.list" "$sandbox_dir/sources.list.before"
+  : > "$sandbox_dir/orbctl-stdin.log"
+  local ubuntu_sources="$sandbox_dir/apt/sources.list.d/ubuntu.sources"
+  local other_sources="$sandbox_dir/apt/sources.list.d/docker.sources"
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\n' > "$other_sources"
+  cp "$other_sources" "$sandbox_dir/docker.sources.before"
+
+  case "$source_state" in
+    main-only) write_main_only_ubuntu_sources "$ubuntu_sources" ;;
+    third-party-archive|mixed-archive-uris|custom-ubuntu-mirror)
+      local archive_uris
+      case "$source_state" in
+        third-party-archive) archive_uris='https://packages.example' ;;
+        mixed-archive-uris) archive_uris=$'HTTP://PORTS.ubuntu.com.:80/ubuntu-ports/\n https://packages.example' ;;
+        custom-ubuntu-mirror) archive_uris='https://mirror.example/ubuntu' ;;
+      esac
+      printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n' "$archive_uris" > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    standard-ubuntu-archives)
+      for archive_uri in http://archive.ubuntu.com/ubuntu https://archive.ubuntu.com/ubuntu/ \
+        http://ports.ubuntu.com/ubuntu-ports https://ports.ubuntu.com/ubuntu-ports/ \
+        http://security.ubuntu.com/ubuntu https://security.ubuntu.com/ubuntu/; do
+        printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+      done
+      ;;
+    archive-dns-root-dot|archive-scheme-case|archive-default-port|archive-unrecognized-authority)
+      local archive_uri
+      local archive_uris=()
+      case "$source_state" in
+        archive-dns-root-dot)
+          archive_uris=(http://ports.ubuntu.com./ubuntu-ports https://ARCHIVE.ubuntu.com./ubuntu/ https://security.ubuntu.com./ubuntu)
+          ;;
+        archive-scheme-case)
+          archive_uris=(HTTP://ports.ubuntu.com/ubuntu-ports HTTPS://ARCHIVE.ubuntu.com/ubuntu/)
+          ;;
+        archive-default-port)
+          archive_uris=(http://ports.ubuntu.com:80/ubuntu-ports https://security.ubuntu.com:443/ubuntu/ HTTP://PORTS.ubuntu.com.:80/ubuntu-ports HTTPS://ARCHIVE.ubuntu.com.:443/ubuntu/)
+          ;;
+        archive-unrecognized-authority)
+          archive_uris=(http://ports.ubuntu.com:443/ubuntu-ports HTTPS://archive.ubuntu.com.:80/ubuntu http://security.ubuntu.com:8080/ubuntu http://ports.ubuntu.com../ubuntu-ports)
+          ;;
+      esac
+      for archive_uri in "${archive_uris[@]}"; do
+        printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+      done
+      if [ "$source_state" = archive-unrecognized-authority ]; then
+        cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      else
+        sed 's/^Components: main$/Components: main universe/' "$ubuntu_sources" > "$sandbox_dir/ubuntu.sources.expected"
+      fi
+      ;;
+    archive-hostname-case|archive-path-case)
+      local archive_uri
+      if [ "$source_state" = archive-hostname-case ]; then
+        for archive_uri in http://ARCHIVE.Ubuntu.COM/ubuntu https://Security.UBUNTU.com/ubuntu/ \
+          https://PORTS.ubuntu.COM/ubuntu-ports; do
+          printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+        done
+        sed 's/^Components: main$/Components: main universe/' "$ubuntu_sources" > "$sandbox_dir/ubuntu.sources.expected"
+      else
+        for archive_uri in http://ARCHIVE.ubuntu.com/Ubuntu https://SECURITY.ubuntu.com/UBUNTU/ \
+          https://PORTS.ubuntu.com/Ubuntu-ports \
+          HTTPS://PORTS.ubuntu.com.:443/Ubuntu-ports \
+          'HTTP://ports.ubuntu.com.:80/ubuntu-ports HTTPS://PORTS.ubuntu.com.:443/Ubuntu-ports'; do
+          printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+        done
+        cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      fi
+      ;;
+    ubuntu-and-third-party-stanzas)
+      printf 'Types: deb\nURIs: https://packages.example\nSuites: noble\nComponents: main\n\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      write_main_only_ubuntu_sources "$sandbox_dir/archive.sources"
+      cat "$sandbox_dir/archive.sources" >> "$ubuntu_sources"
+      sed -e 's/^Components: main$/Components: main universe/' \
+        -e 's/^Components: main restricted$/Components: main restricted universe/' \
+        "$sandbox_dir/archive.sources" >> "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    universe-present)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's/^Components: .*/Components: main restricted universe multiverse/' "$ubuntu_sources"
+      ;;
+    missing-components)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i '/^Components: main restricted$/d' "$ubuntu_sources"
+      ;;
+    multiline-components)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's/^Components: main restricted$/Components: main\n restricted/' "$ubuntu_sources"
+      ;;
+    multiline-components-with-universe)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's/^Components: main.*$/Components: main\n# comment between continuations\n universe/' "$ubuntu_sources"
+      ;;
+    not-regular) mkdir "$ubuntu_sources" ;;
+    continued-fields)
+      cat > "$ubuntu_sources" <<'SOURCES'
+Types: deb
+URIs:
+ http://ports.ubuntu.com/ubuntu-ports/
+Suites: noble
+ noble-updates
+# comment inside a stanza
+Components: main
+Signed-By:
+ /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+      ;;
+    field-name-whitespace)
+      printf 'Types : deb\nURIs\t: http://ports.ubuntu.com/ubuntu-ports/\nSuites  : noble\nComponents \t: main\nEnabled\t : yes\n\nTypes : deb-src\nEnabled \t: no\n' > "$ubuntu_sources"
+      printf 'Types : deb\nURIs\t: http://ports.ubuntu.com/ubuntu-ports/\nSuites  : noble\nComponents \t: main universe\nEnabled\t : yes\n\nTypes : deb-src\nEnabled \t: no\n' > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    leading-indented-preamble)
+      printf ' # indented comment before the first field\n\tignored preamble\n' > "$ubuntu_sources"
+      write_main_only_ubuntu_sources "$sandbox_dir/archive.sources"
+      cat "$sandbox_dir/archive.sources" >> "$ubuntu_sources"
+      printf '\n http://ports.ubuntu.com/ubuntu-ports/\nTypes: deb\nURIs: file:/srv/local-repo\nSuites: ./\n' >> "$ubuntu_sources"
+      ;;
+    leading-indented-incomplete-stanza)
+      printf ' # ignored preamble\nTypes: deb\n' > "$ubuntu_sources"
+      ;;
+    flat-only)
+      printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./\nTrusted: yes\n' > "$ubuntu_sources"
+      ;;
+    custom-path)
+      printf 'Types: deb\nURIs: https://example.invalid/repo\nSuites: custom/path/\nSigned-By: /usr/share/keyrings/example.gpg\n' > "$ubuntu_sources"
+      ;;
+    mixed-flat-and-archive)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\nTypes: deb\nURIs: file:/srv/local-repo\nSuites: ./\n' >> "$ubuntu_sources"
+      ;;
+    disabled-stanza)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\nTypes: deb\nEnabled: no\nURIs: /srv/disabled-repo\nSuites: noble-proposed\nComponents: main multiverse\n' >> "$ubuntu_sources"
+      printf '\nTypes: deb-src\nEnabled: False\n' >> "$ubuntu_sources"
+      ;;
+    exact-path-with-components)
+      printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./\nComponents: main\n' > "$ubuntu_sources"
+      ;;
+    mixed-suite-kinds)
+      printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./ noble\nComponents: main\n' > "$ubuntu_sources"
+      ;;
+    disabled-numeric-zeros)
+      # apt StringToBool: a whole-value strtol(..., 0) result of 0 is false.
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      # Ubuntu 24.04 glibc strtol also accepts the C23 0b binary prefix.
+      for enabled_value in 00 +0 -0 0x0 0X00 0b0; do
+        printf '\nTypes: deb\nEnabled: %s\n' "$enabled_value" >> "$ubuntu_sources"
+      done
+      ;;
+    enabled-token-*)
+      # Nonzero or partially parsed numbers leave the stanza enabled, so its
+      # missing URIs must still be rejected.
+      printf 'Types: deb\nEnabled: %s\nSuites: noble\nComponents: main\n' "${source_state#enabled-token-}" > "$ubuntu_sources"
+      ;;
+    empty-sources)
+      : > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    empty-types)
+      printf 'Types: \t\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    missing-types)
+      printf 'URIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n' > "$ubuntu_sources"
+      ;;
+    comment-only-sources)
+      printf "# Archives moved to another sources file\n\n# No active stanza here\n" > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-components)
+      # apt uses the last occurrence of a field, including its continuations.
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: universe\nComponents: main\n' > "$ubuntu_sources"
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: universe\nComponents: main universe\n' > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-continued-components)
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n universe\nComponents: main\n restricted\n' > "$ubuntu_sources"
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n universe\nComponents: main universe\n restricted\n' > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-components-final-universe)
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\nComponents: main\n universe\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-enabled-last-disabled)
+      printf 'Types: deb\nEnabled: yes\nEnabled: no\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-enabled-last-enabled)
+      printf 'Types: deb\nEnabled: no\nSuites: noble\nComponents: main\nEnabled: yes\n' > "$ubuntu_sources"
+      ;;
+    duplicate-uris-last-valid)
+      printf 'Types: deb\nURIs: /srv/old-repo\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n' > "$ubuntu_sources"
+      sed 's/^Components: main$/Components: main universe/' "$ubuntu_sources" > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-uris-last-invalid)
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nURIs: /srv/new-repo\nSuites: noble\nComponents: main\n' > "$ubuntu_sources"
+      ;;
+    colonless-flat-uri)
+      printf 'Types: deb\nURIs: /srv/local-repo\nSuites: ./\n' > "$ubuntu_sources"
+      ;;
+    colonless-second-uri)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's|^URIs: http://ports.ubuntu.com/ubuntu-ports/$|URIs: http://ports.ubuntu.com/ubuntu-ports/ /srv/local-repo|' "$ubuntu_sources"
+      ;;
+    unknown-disabled-type)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\nTypes: rpm\nEnabled: no\n' >> "$ubuntu_sources"
+      ;;
+    empty-uris)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's|^URIs: http://ports.ubuntu.com/ubuntu-ports/$|URIs:|' "$ubuntu_sources"
+      ;;
+  esac
+  [ -d "$ubuntu_sources" ] || cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before"
+
+  cat > "$sandbox_dir/bin/dpkg" <<'MOCK'
+#!/usr/bin/env bash
+[ "${1:-}" = --print-architecture ] && { printf 'arm64\n'; exit 0; }
+exit 64
+MOCK
+  cat > "$sandbox_dir/bin/apt-get" <<'MOCK'
+#!/usr/bin/env bash
+printf 'guest apt-get %s\n' "$*" >> "${MOCK_COMMAND_LOG:?}"
+MOCK
+  chmod +x "$sandbox_dir/bin/dpkg" "$sandbox_dir/bin/apt-get"
+
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_ORBCTL_STDIN_LOG="$sandbox_dir/orbctl-stdin.log" \
+      MOCK_EXECUTE_GUEST_APT_SOURCES=1 \
+      LITTLE_CI_APT_SOURCES_DIR="$sandbox_dir/apt/sources.list.d" \
+      LITTLE_CI_APT_SOURCES_LIST="$sandbox_dir/apt/sources.list" \
+      MOCK_MACHINE_EXISTS=1 \
+      MOCK_MACHINE_NAME=little-ci-acme-widget-studio \
+      MOCK_ORB_INFO='{"record":{"name":"little-ci-acme-widget-studio","state":"running","image":{"distro":"ubuntu","version":"noble","arch":"arm64"},"config":{"isolated":true,"isolate_network":true,"forward_ssh_agent":false,"default_username":"deploy","cpu_limit":2,"memory_limit_mib":4096,"disk_limit_bytes":51539607552}}}' \
+      MOCK_ORB_IDENTITY=$'machine=little-ci-acme-widget-studio\nscope=repository\ntarget=acme/widget\nprefix=little-ci-acme-widget-studio\nuser=deploy\nhome=/home/deploy' \
+      GITHUB_SCOPE=repository \
+      GITHUB_URL=https://github.com/acme/widget \
+      FLEET_ID=studio \
+      ./provision-orbstack.sh 2>&1
+  )"
+  status=$?
+  set -e
+  cmp -s "$other_sources" "$sandbox_dir/docker.sources.before" || fail 'unrelated apt source was modified'
+  cmp -s "$sandbox_dir/apt/sources.list" "$sandbox_dir/sources.list.before" || fail 'active classic apt source was removed or modified'
+  [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
+
+  case "$source_state" in
+    main-only|third-party-archive|mixed-archive-uris|custom-ubuntu-mirror|standard-ubuntu-archives|archive-dns-root-dot|archive-scheme-case|archive-default-port|archive-unrecognized-authority|archive-hostname-case|archive-path-case|ubuntu-and-third-party-stanzas|universe-present|continued-fields|field-name-whitespace|leading-indented-preamble|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources|empty-types)
+      assert_status 0 "$status"
+      local expected_sources
+      if [ -f "$sandbox_dir/ubuntu.sources.expected" ]; then
+        expected_sources="$(cat "$sandbox_dir/ubuntu.sources.expected")"
+      elif [[ "$source_state" =~ ^(multiline-components-with-universe|flat-only|custom-path)$ ]]; then
+        expected_sources="$(cat "$sandbox_dir/ubuntu.sources.before")"
+      else
+        expected_sources="$(sed -e 's/^Components: main$/Components: main universe/' \
+          -e 's/^Components: main restricted$/Components: main restricted universe/' \
+          "$sandbox_dir/ubuntu.sources.before")"
+      fi
+      [ "$(cat "$ubuntu_sources")" = "$expected_sources" ] || \
+        fail "ubuntu.sources not updated exactly: $(diff <(printf '%s\n' "$expected_sources") "$ubuntu_sources" | tr '\n' ' ')"
+      if [[ "$source_state" =~ ^(third-party-archive|mixed-archive-uris|custom-ubuntu-mirror)$ ]]; then
+        cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail 'unverified archive sources changed'
+      fi
+      if [[ "$source_state" =~ ^(empty-sources|comment-only-sources|empty-types|archive-path-case)$ ]]; then
+        cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail "inactive sources changed"
+      fi
+      # Sources are repaired and validated before any guest apt use.
+      assert_file_order "$sandbox_dir/command.log" 'guest-script ubuntu.sources' 'guest-script apt-get'
+      assert_file_order "$sandbox_dir/command.log" 'guest-script ubuntu.sources' './provision-job-dependencies.sh'
+      ;;
+    *)
+      [ "$status" -ne 0 ] || fail "$source_state ubuntu.sources was accepted"
+      assert_contains "$output" "$expected_message"
+      assert_file_not_contains "$sandbox_dir/command.log" 'guest apt-get'
+      assert_file_not_contains "$sandbox_dir/command.log" 'guest-script apt-get'
+      assert_file_not_contains "$sandbox_dir/command.log" 'provision-job-dependencies.sh'
+      [ -d "$ubuntu_sources" ] || cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || \
+        fail 'malformed ubuntu.sources was modified'
+      ;;
+  esac
+}
+
 test_orbstack_provisioning_installs_job_dependencies_in_guest() {
   new_sandbox
   install_uname_mock arm64
@@ -3042,6 +3366,53 @@ run_case 'job dependencies require root before apt' test_job_dependencies_reject
 run_case 'job dependencies fail on apt install failure' test_job_dependencies_fail_when_apt_or_verification_fails apt
 run_case 'job dependencies fail when packages remain missing' test_job_dependencies_fail_when_apt_or_verification_fails verification
 run_case 'job dependencies load owning config without changing packages' test_job_dependencies_load_owning_config_without_changing_packages
+run_case 'OrbStack enables universe in main-only deb822 source before dependencies' test_orbstack_enables_universe_in_existing_deb822_sources main-only
+run_case 'OrbStack preserves enabled third-party archive' test_orbstack_enables_universe_in_existing_deb822_sources third-party-archive
+run_case 'OrbStack preserves ambiguous continued Ubuntu and third-party URIs' test_orbstack_enables_universe_in_existing_deb822_sources mixed-archive-uris
+run_case 'OrbStack preserves unrecognized Ubuntu mirror' test_orbstack_enables_universe_in_existing_deb822_sources custom-ubuntu-mirror
+run_case 'OrbStack enables universe for standard Ubuntu archive URIs' test_orbstack_enables_universe_in_existing_deb822_sources standard-ubuntu-archives
+run_case 'OrbStack recognizes Ubuntu archive terminal DNS root dots without rewriting URIs' test_orbstack_enables_universe_in_existing_deb822_sources archive-dns-root-dot
+run_case 'OrbStack recognizes Ubuntu archive uppercase HTTP schemes without rewriting URIs' test_orbstack_enables_universe_in_existing_deb822_sources archive-scheme-case
+run_case 'OrbStack recognizes matching default HTTP ports and terminal DNS root dots' test_orbstack_enables_universe_in_existing_deb822_sources archive-default-port
+run_case 'OrbStack preserves other archive ports and repeated terminal DNS dots' test_orbstack_enables_universe_in_existing_deb822_sources archive-unrecognized-authority
+run_case 'OrbStack compares verified Ubuntu archive hostnames without case' test_orbstack_enables_universe_in_existing_deb822_sources archive-hostname-case
+run_case 'OrbStack preserves case-sensitive Ubuntu archive paths and mixed URIs' test_orbstack_enables_universe_in_existing_deb822_sources archive-path-case
+run_case 'OrbStack changes only verified Ubuntu stanzas beside third-party archive' test_orbstack_enables_universe_in_existing_deb822_sources ubuntu-and-third-party-stanzas
+run_case 'OrbStack leaves deb822 source with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources universe-present
+run_case 'OrbStack rejects deb822 stanza without Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-components 'lacks Components'
+run_case 'OrbStack adds universe once to continued deb822 Components' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components
+run_case 'OrbStack leaves continued deb822 Components with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components-with-universe
+run_case 'OrbStack rejects non-regular ubuntu.sources before apt' test_orbstack_enables_universe_in_existing_deb822_sources not-regular 'is not a readable regular file'
+run_case 'OrbStack accepts continued deb822 URIs, Suites, and Signed-By' test_orbstack_enables_universe_in_existing_deb822_sources continued-fields
+run_case 'OrbStack accepts whitespace before deb822 field colons' test_orbstack_enables_universe_in_existing_deb822_sources field-name-whitespace
+run_case 'OrbStack preserves ignored indented preambles before deb822 fields' test_orbstack_enables_universe_in_existing_deb822_sources leading-indented-preamble
+run_case 'OrbStack rejects incomplete active deb822 stanza after indented preamble' test_orbstack_enables_universe_in_existing_deb822_sources leading-indented-incomplete-stanza 'lacks URIs'
+run_case 'OrbStack preserves flat ./ deb822 stanza without Components' test_orbstack_enables_universe_in_existing_deb822_sources flat-only
+run_case 'OrbStack preserves exact-path deb822 Suite with trailing slash' test_orbstack_enables_universe_in_existing_deb822_sources custom-path
+run_case 'OrbStack adds universe only to archive stanzas beside flat stanza' test_orbstack_enables_universe_in_existing_deb822_sources mixed-flat-and-archive
+run_case 'OrbStack preserves disabled deb822 stanzas byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources disabled-stanza
+run_case 'OrbStack rejects exact-path Suite with Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources exact-path-with-components 'exact-path Suites must omit Components'
+run_case 'OrbStack rejects mixed exact-path and archive Suites before apt' test_orbstack_enables_universe_in_existing_deb822_sources mixed-suite-kinds 'mixes exact-path and archive Suites'
+run_case 'OrbStack preserves stanzas disabled by numeric zero Enabled values' test_orbstack_enables_universe_in_existing_deb822_sources disabled-numeric-zeros
+run_case 'OrbStack validates stanza with numeric nonzero Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x1 'lacks URIs'
+run_case 'OrbStack validates stanza with negative Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token--1 'lacks URIs'
+run_case 'OrbStack validates stanza with partially numeric Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x 'lacks URIs'
+run_case 'OrbStack validates stanza with invalid octal Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-08 'lacks URIs'
+run_case 'OrbStack retains empty existing sources byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources empty-sources
+run_case 'OrbStack preserves explicit empty Types as an inert stanza' test_orbstack_enables_universe_in_existing_deb822_sources empty-types
+run_case 'OrbStack rejects absent Types before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-types 'lacks Types'
+run_case 'OrbStack retains comment-only existing sources byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources comment-only-sources
+run_case 'OrbStack adds universe to final duplicate Components only' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components
+run_case 'OrbStack uses final continued duplicate Components' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-continued-components
+run_case 'OrbStack leaves final duplicate Components with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components-final-universe
+run_case 'OrbStack preserves stanza disabled by final duplicate Enabled' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-enabled-last-disabled
+run_case 'OrbStack validates stanza enabled by final duplicate Enabled' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-enabled-last-enabled 'lacks URIs'
+run_case 'OrbStack accepts final valid duplicate URIs' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-uris-last-valid
+run_case 'OrbStack rejects final invalid duplicate URIs before apt' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-uris-last-invalid "URI '/srv/new-repo' without ':'"
+run_case 'OrbStack rejects enabled flat URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-flat-uri "URI '/srv/local-repo' without ':'"
+run_case 'OrbStack rejects any enabled URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-second-uri "URI '/srv/local-repo' without ':'"
+run_case 'OrbStack rejects unknown Types even in disabled stanza before apt' test_orbstack_enables_universe_in_existing_deb822_sources unknown-disabled-type "unknown Types value 'rpm'"
+run_case 'OrbStack rejects empty deb822 URIs before apt' test_orbstack_enables_universe_in_existing_deb822_sources empty-uris 'lacks URIs'
 run_case 'OrbStack provisioning installs job dependencies in guest as root' test_orbstack_provisioning_installs_job_dependencies_in_guest
 run_case 'local uninstall unregisters and removes the selected runner' test_local_uninstall_uses_remove_token_and_deletes_selected_runner
 run_case 'local uninstall rejects RUNNER_HOME=/ before commands' test_local_uninstall_rejects_root_runner_home_before_commands

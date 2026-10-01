@@ -382,7 +382,30 @@ provision, doctor, and health checks again.
 Re-run `provision-orbstack.sh` after changing compatible host configuration. A
 re-run also installs any CI job dependencies that a machine provisioned by an
 older Little-CI release is missing; it does not upgrade packages that are
-already installed.
+already installed. Before any guest apt command, it adds `universe` to an
+enabled archive-style stanza (one whose `Suites` take `Components`) in an
+existing `/etc/apt/sources.list.d/ubuntu.sources` only when every URI uses HTTP
+or HTTPS with `archive.ubuntu.com/ubuntu`, `security.ubuntu.com/ubuntu`, or
+`ports.ubuntu.com/ubuntu-ports` (an optional trailing `/` is accepted). Schemes
+and hostnames are compared without case; matching default ports (`80` for HTTP,
+`443` for HTTPS) and one terminal DNS root dot are ignored for comparison.
+Other ports remain unrecognized; paths remain case-sensitive and URI text is preserved.
+Third-party archives, unrecognized custom Ubuntu mirrors, and stanzas mixing
+verified and unrecognized URIs stay byte-identical. If a custom mirror lacks a
+required dependency, apt installation fails normally. The update preserves the
+file's other lines and every other apt source, including the classic
+`/etc/apt/sources.list` when it supplies the active archive. Exact-path stanzas (every suite
+ends in `/`, such as `./`, with no `Components`) and stanzas apt treats as
+disabled (`Enabled: no`) stay byte-identical. An explicit empty `Types:` field
+makes a stanza inert and leaves it byte-identical. Indented continuation lines are
+accepted for every field; a continued `Components` field gains `universe` on its
+first line only when no line already lists it. An unreadable, non-regular, or
+malformed `ubuntu.sources` stops provisioning before apt runs: for example, a
+stanza without `Types` or with a `Types` value other
+than `deb` or `deb-src`, an enabled stanza without `URIs` or `Suites` or with a
+URI lacking `:` (such as a bare `/srv/repo` instead of `file:/srv/repo`), an
+archive stanza without `Components`, or an exact-path suite combined with
+`Components` or with archive suites.
 Resource settings are part of strict machine validation, so changing
 `ORB_CPUS`, `ORB_MEMORY`, or `ORB_DISK` requires changing the existing OrbStack
 machine settings to match before provisioning will continue.
