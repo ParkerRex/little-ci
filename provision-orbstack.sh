@@ -255,7 +255,6 @@ add_universe_component() {
           changed = 1
         }
       }
-      stanza_count++
       in_stanza = 0
       current_field = ""
       split("", fields)
@@ -282,7 +281,6 @@ add_universe_component() {
     END {
       if (failed) exit 1
       finish_stanza()
-      if (stanza_count == 0) reject("no deb822 source stanzas")
       if (changed && updated_path != "")
         for (i = 1; i <= NR; i++) print lines[i] > updated_path
       print (changed ? "changed" : "unchanged")

@@ -2665,6 +2665,14 @@ SOURCES
       # missing URIs must still be rejected.
       printf 'Types: deb\nEnabled: %s\nSuites: noble\nComponents: main\n' "${source_state#enabled-token-}" > "$ubuntu_sources"
       ;;
+    empty-sources)
+      : > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    comment-only-sources)
+      printf "# Archives moved to another sources file\n\n# No active stanza here\n" > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
     duplicate-components)
       # apt uses the last occurrence of a field, including its continuations.
       printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: universe\nComponents: main\n' > "$ubuntu_sources"
@@ -2746,7 +2754,7 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid)
+    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources)
       assert_status 0 "$status"
       local expected_sources
       if [ -f "$sandbox_dir/ubuntu.sources.expected" ]; then
@@ -2760,6 +2768,9 @@ MOCK
       fi
       [ "$(cat "$ubuntu_sources")" = "$expected_sources" ] || \
         fail "ubuntu.sources not updated exactly: $(diff <(printf '%s\n' "$expected_sources") "$ubuntu_sources" | tr '\n' ' ')"
+      if [[ "$source_state" =~ ^(empty-sources|comment-only-sources)$ ]]; then
+        cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail "inactive sources changed"
+      fi
       # Sources are repaired and validated before any guest apt use.
       assert_file_order "$sandbox_dir/command.log" 'guest-script ubuntu.sources' 'guest-script apt-get'
       assert_file_order "$sandbox_dir/command.log" 'guest-script ubuntu.sources' './provision-job-dependencies.sh'
@@ -3283,6 +3294,8 @@ run_case 'OrbStack validates stanza with numeric nonzero Enabled value' test_orb
 run_case 'OrbStack validates stanza with negative Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token--1 'lacks URIs'
 run_case 'OrbStack validates stanza with partially numeric Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x 'lacks URIs'
 run_case 'OrbStack validates stanza with invalid octal Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-08 'lacks URIs'
+run_case 'OrbStack retains empty existing sources byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources empty-sources
+run_case 'OrbStack retains comment-only existing sources byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources comment-only-sources
 run_case 'OrbStack adds universe to final duplicate Components only' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components
 run_case 'OrbStack uses final continued duplicate Components' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-continued-components
 run_case 'OrbStack leaves final duplicate Components with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components-final-universe
