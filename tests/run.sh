@@ -2298,7 +2298,7 @@ test_orbstack_transfers_use_explicit_allowlist() {
 }
 
 # Ubuntu packages Little Worker's trusted read-only jobs need. The Playwright
-# entries are the v1.63.0 `install-deps chromium` set for ubuntu24.04 (the
+# entries are the v1.59.1 `install-deps chromium` set for ubuntu24.04 (the
 # chromium group plus the tools group it always adds), kept independent of the
 # script so a drifted copy fails here.
 expected_job_dependency_packages=(
