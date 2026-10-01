@@ -197,7 +197,7 @@ ubuntu_sources="$apt_sources_dir/ubuntu.sources"
 # there. Exits nonzero without output on malformed deb822. POSIX awk only:
 # this runs before base packages, so python3 may not exist yet.
 add_universe_component() {
-  awk -v sources_path="$1" -v updated_path="${2:-}" '
+  awk -v sources_path="$1" -v updated_path="${2:-}" -v q="'" '
     function reject(reason) {
       printf "ERROR: %s: %s; fix it before provisioning\n", sources_path, reason > "/dev/stderr"
       failed = 1
@@ -208,19 +208,50 @@ add_universe_component() {
       for (i = 1; i <= count; i++) if (parts[i] == "universe") return 1
       return 0
     }
-    function finish_stanza(   names, labels, i) {
+    function lacks(field_name) {
+      return fields[field_name] !~ /[^[:space:]]/
+    }
+    # Mirrors apt 2.7 deb822 rules: every stanza needs Types limited to deb
+    # and deb-src; a stanza whose Enabled value is false is otherwise ignored;
+    # enabled stanzas need URIs that each contain ":" and Suites; exact-path
+    # Suites (ending in /) must omit Components, other Suites require it, and
+    # one stanza cannot mix the two.
+    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count) {
       if (!in_stanza) return
-      split("types uris suites components", names, " ")
-      split("Types URIs Suites Components", labels, " ")
-      for (i = 1; i <= 4; i++)
-        if (fields[names[i]] !~ /[^[:space:]]/)
-          reject("deb822 stanza at line " stanza_start " lacks " labels[i])
-      # Continued Components values were accumulated above; append to the
-      # first Components line so continuation lines stay byte-identical.
-      if (!has_universe(fields["components"])) {
-        sub(/[[:space:]]+$/, "", lines[components_line])
-        lines[components_line] = lines[components_line] " universe"
-        changed = 1
+      if (lacks("types")) reject("deb822 stanza at line " stanza_start " lacks Types")
+      count = split(fields["types"], types, /[[:space:]]+/)
+      for (i = 1; i <= count; i++)
+        if (types[i] != "" && types[i] != "deb" && types[i] != "deb-src")
+          reject("deb822 stanza at line " stanza_start " has unknown Types value " q types[i] q)
+      enabled = tolower(fields["enabled"])
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", enabled)
+      if (enabled !~ /^(0|no|false|without|off|disable)$/) {
+        if (lacks("uris")) reject("deb822 stanza at line " stanza_start " lacks URIs")
+        if (lacks("suites")) reject("deb822 stanza at line " stanza_start " lacks Suites")
+        count = split(fields["uris"], uris, /[[:space:]]+/)
+        for (i = 1; i <= count; i++)
+          if (uris[i] != "" && index(uris[i], ":") == 0)
+            reject("deb822 stanza at line " stanza_start " has URI " q uris[i] q " without " q ":" q)
+        count = split(fields["suites"], suites, /[[:space:]]+/)
+        suite_count = exact_count = 0
+        for (i = 1; i <= count; i++) {
+          if (suites[i] == "") continue
+          suite_count++
+          if (suites[i] ~ /\/$/) exact_count++
+        }
+        if (exact_count > 0 && exact_count < suite_count)
+          reject("deb822 stanza at line " stanza_start " mixes exact-path and archive Suites")
+        if (exact_count > 0 && !lacks("components"))
+          reject("deb822 stanza at line " stanza_start " has exact-path Suites; exact-path Suites must omit Components")
+        if (exact_count == 0 && lacks("components"))
+          reject("deb822 stanza at line " stanza_start " lacks Components")
+        # Continued Components values were accumulated above; append to the
+        # first Components line so continuation lines stay byte-identical.
+        if (exact_count == 0 && !has_universe(fields["components"])) {
+          sub(/[[:space:]]+$/, "", lines[components_line])
+          lines[components_line] = lines[components_line] " universe"
+          changed = 1
+        }
       }
       stanza_count++
       in_stanza = 0

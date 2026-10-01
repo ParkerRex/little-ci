@@ -2631,6 +2631,38 @@ SOURCES
       write_main_only_ubuntu_sources "$ubuntu_sources"
       printf '\n http://ports.ubuntu.com/ubuntu-ports/\nTypes: deb\n' >> "$ubuntu_sources"
       ;;
+    flat-only)
+      printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./\nTrusted: yes\n' > "$ubuntu_sources"
+      ;;
+    custom-path)
+      printf 'Types: deb\nURIs: https://example.invalid/repo\nSuites: custom/path/\nSigned-By: /usr/share/keyrings/example.gpg\n' > "$ubuntu_sources"
+      ;;
+    mixed-flat-and-archive)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\nTypes: deb\nURIs: file:/srv/local-repo\nSuites: ./\n' >> "$ubuntu_sources"
+      ;;
+    disabled-stanza)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\nTypes: deb\nEnabled: no\nURIs: /srv/disabled-repo\nSuites: noble-proposed\nComponents: main multiverse\n' >> "$ubuntu_sources"
+      printf '\nTypes: deb-src\nEnabled: False\n' >> "$ubuntu_sources"
+      ;;
+    exact-path-with-components)
+      printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./\nComponents: main\n' > "$ubuntu_sources"
+      ;;
+    mixed-suite-kinds)
+      printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./ noble\nComponents: main\n' > "$ubuntu_sources"
+      ;;
+    colonless-flat-uri)
+      printf 'Types: deb\nURIs: /srv/local-repo\nSuites: ./\n' > "$ubuntu_sources"
+      ;;
+    colonless-second-uri)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's|^URIs: http://ports.ubuntu.com/ubuntu-ports/$|URIs: http://ports.ubuntu.com/ubuntu-ports/ /srv/local-repo|' "$ubuntu_sources"
+      ;;
+    unknown-disabled-type)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\nTypes: rpm\nEnabled: no\n' >> "$ubuntu_sources"
+      ;;
     empty-uris)
       write_main_only_ubuntu_sources "$ubuntu_sources"
       sed -i 's|^URIs: http://ports.ubuntu.com/ubuntu-ports/$|URIs:|' "$ubuntu_sources"
@@ -2674,10 +2706,10 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe)
+    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza)
       assert_status 0 "$status"
       local expected_sources
-      if [ "$source_state" = multiline-components-with-universe ]; then
+      if [[ "$source_state" =~ ^(multiline-components-with-universe|flat-only|custom-path)$ ]]; then
         expected_sources="$(cat "$sandbox_dir/ubuntu.sources.before")"
       else
         expected_sources="$(sed -e 's/^Components: main$/Components: main universe/' \
@@ -3198,6 +3230,15 @@ run_case 'OrbStack leaves continued deb822 Components with universe unchanged' t
 run_case 'OrbStack rejects non-regular ubuntu.sources before apt' test_orbstack_enables_universe_in_existing_deb822_sources not-regular 'is not a readable regular file'
 run_case 'OrbStack accepts continued deb822 URIs, Suites, and Signed-By' test_orbstack_enables_universe_in_existing_deb822_sources continued-fields
 run_case 'OrbStack rejects orphan deb822 continuation before apt' test_orbstack_enables_universe_in_existing_deb822_sources orphan-continuation 'malformed deb822 continuation'
+run_case 'OrbStack preserves flat ./ deb822 stanza without Components' test_orbstack_enables_universe_in_existing_deb822_sources flat-only
+run_case 'OrbStack preserves exact-path deb822 Suite with trailing slash' test_orbstack_enables_universe_in_existing_deb822_sources custom-path
+run_case 'OrbStack adds universe only to archive stanzas beside flat stanza' test_orbstack_enables_universe_in_existing_deb822_sources mixed-flat-and-archive
+run_case 'OrbStack preserves disabled deb822 stanzas byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources disabled-stanza
+run_case 'OrbStack rejects exact-path Suite with Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources exact-path-with-components 'exact-path Suites must omit Components'
+run_case 'OrbStack rejects mixed exact-path and archive Suites before apt' test_orbstack_enables_universe_in_existing_deb822_sources mixed-suite-kinds 'mixes exact-path and archive Suites'
+run_case 'OrbStack rejects enabled flat URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-flat-uri "URI '/srv/local-repo' without ':'"
+run_case 'OrbStack rejects any enabled URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-second-uri "URI '/srv/local-repo' without ':'"
+run_case 'OrbStack rejects unknown Types even in disabled stanza before apt' test_orbstack_enables_universe_in_existing_deb822_sources unknown-disabled-type "unknown Types value 'rpm'"
 run_case 'OrbStack rejects empty deb822 URIs before apt' test_orbstack_enables_universe_in_existing_deb822_sources empty-uris 'lacks URIs'
 run_case 'OrbStack provisioning installs job dependencies in guest as root' test_orbstack_provisioning_installs_job_dependencies_in_guest
 run_case 'local uninstall unregisters and removes the selected runner' test_local_uninstall_uses_remove_token_and_deletes_selected_runner
