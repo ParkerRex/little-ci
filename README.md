@@ -382,9 +382,14 @@ provision, doctor, and health checks again.
 Re-run `provision-orbstack.sh` after changing compatible host configuration. A
 re-run also installs any CI job dependencies that a machine provisioned by an
 older Little-CI release is missing; it does not upgrade packages that are
-already installed. Before any guest apt command, it adds `universe` to any
+already installed. Before any guest apt command, it adds `universe` to an
 enabled archive-style stanza (one whose `Suites` take `Components`) in an
-existing `/etc/apt/sources.list.d/ubuntu.sources` that omits it, preserving that
+existing `/etc/apt/sources.list.d/ubuntu.sources` only when every URI uses HTTP
+or HTTPS with `archive.ubuntu.com/ubuntu`, `security.ubuntu.com/ubuntu`, or
+`ports.ubuntu.com/ubuntu-ports` (an optional trailing `/` is accepted).
+Third-party archives, unrecognized custom Ubuntu mirrors, and stanzas mixing
+verified and unrecognized URIs stay byte-identical. If a custom mirror lacks a
+required dependency, apt installation fails normally. The update preserves the
 file's other lines and every other apt source, including the classic
 `/etc/apt/sources.list` when it supplies the active archive. Exact-path stanzas (every suite
 ends in `/`, such as `./`, with no `Components`) and stanzas apt treats as

@@ -2598,6 +2598,32 @@ test_orbstack_enables_universe_in_existing_deb822_sources() {
 
   case "$source_state" in
     main-only) write_main_only_ubuntu_sources "$ubuntu_sources" ;;
+    third-party-archive|mixed-archive-uris|custom-ubuntu-mirror)
+      local archive_uris
+      case "$source_state" in
+        third-party-archive) archive_uris='https://packages.example' ;;
+        mixed-archive-uris) archive_uris=$'http://ports.ubuntu.com/ubuntu-ports/\n https://packages.example' ;;
+        custom-ubuntu-mirror) archive_uris='https://mirror.example/ubuntu' ;;
+      esac
+      printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n' "$archive_uris" > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    standard-ubuntu-archives)
+      for archive_uri in http://archive.ubuntu.com/ubuntu https://archive.ubuntu.com/ubuntu/ \
+        http://ports.ubuntu.com/ubuntu-ports https://ports.ubuntu.com/ubuntu-ports/ \
+        http://security.ubuntu.com/ubuntu https://security.ubuntu.com/ubuntu/; do
+        printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+      done
+      ;;
+    ubuntu-and-third-party-stanzas)
+      printf 'Types: deb\nURIs: https://packages.example\nSuites: noble\nComponents: main\n\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      write_main_only_ubuntu_sources "$sandbox_dir/archive.sources"
+      cat "$sandbox_dir/archive.sources" >> "$ubuntu_sources"
+      sed -e 's/^Components: main$/Components: main universe/' \
+        -e 's/^Components: main restricted$/Components: main restricted universe/' \
+        "$sandbox_dir/archive.sources" >> "$sandbox_dir/ubuntu.sources.expected"
+      ;;
     universe-present)
       write_main_only_ubuntu_sources "$ubuntu_sources"
       sed -i 's/^Components: .*/Components: main restricted universe multiverse/' "$ubuntu_sources"
@@ -2765,7 +2791,7 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields|field-name-whitespace|leading-indented-preamble|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources)
+    main-only|third-party-archive|mixed-archive-uris|custom-ubuntu-mirror|standard-ubuntu-archives|ubuntu-and-third-party-stanzas|universe-present|continued-fields|field-name-whitespace|leading-indented-preamble|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources)
       assert_status 0 "$status"
       local expected_sources
       if [ -f "$sandbox_dir/ubuntu.sources.expected" ]; then
@@ -2779,6 +2805,9 @@ MOCK
       fi
       [ "$(cat "$ubuntu_sources")" = "$expected_sources" ] || \
         fail "ubuntu.sources not updated exactly: $(diff <(printf '%s\n' "$expected_sources") "$ubuntu_sources" | tr '\n' ' ')"
+      if [[ "$source_state" =~ ^(third-party-archive|mixed-archive-uris|custom-ubuntu-mirror)$ ]]; then
+        cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail 'unverified archive sources changed'
+      fi
       if [[ "$source_state" =~ ^(empty-sources|comment-only-sources)$ ]]; then
         cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail "inactive sources changed"
       fi
@@ -3287,6 +3316,11 @@ run_case 'job dependencies fail on apt install failure' test_job_dependencies_fa
 run_case 'job dependencies fail when packages remain missing' test_job_dependencies_fail_when_apt_or_verification_fails verification
 run_case 'job dependencies load owning config without changing packages' test_job_dependencies_load_owning_config_without_changing_packages
 run_case 'OrbStack enables universe in main-only deb822 source before dependencies' test_orbstack_enables_universe_in_existing_deb822_sources main-only
+run_case 'OrbStack preserves enabled third-party archive' test_orbstack_enables_universe_in_existing_deb822_sources third-party-archive
+run_case 'OrbStack preserves ambiguous continued Ubuntu and third-party URIs' test_orbstack_enables_universe_in_existing_deb822_sources mixed-archive-uris
+run_case 'OrbStack preserves unrecognized Ubuntu mirror' test_orbstack_enables_universe_in_existing_deb822_sources custom-ubuntu-mirror
+run_case 'OrbStack enables universe for standard Ubuntu archive URIs' test_orbstack_enables_universe_in_existing_deb822_sources standard-ubuntu-archives
+run_case 'OrbStack changes only verified Ubuntu stanzas beside third-party archive' test_orbstack_enables_universe_in_existing_deb822_sources ubuntu-and-third-party-stanzas
 run_case 'OrbStack leaves deb822 source with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources universe-present
 run_case 'OrbStack rejects deb822 stanza without Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-components 'lacks Components'
 run_case 'OrbStack adds universe once to continued deb822 Components' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components

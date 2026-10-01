@@ -182,8 +182,8 @@ main() {
 
   # Some workflows expect Ubuntu's deb822 source file. OrbStack's image may
   # still ship the classic /etc/apt/sources.list instead. CI job dependencies
-  # come from universe, so an existing ubuntu.sources gains that component in
-  # place; other fields and other source files are preserved. The LITTLE_CI_APT_*
+  # come from universe, so verified Ubuntu archives in an existing ubuntu.sources
+  # gain that component in place; other fields and sources are preserved. The LITTLE_CI_APT_*
   # paths are test hooks only; orbctl does not forward Mac environment. This runs
   # before any guest apt use so malformed sources stop provisioning first.
   echo "== ensuring Ubuntu deb822 package sources =="
@@ -216,7 +216,7 @@ add_universe_component() {
     # enabled stanzas need URIs that each contain ":" and Suites; exact-path
     # Suites (ending in /) must omit Components, other Suites require it, and
     # one stanza cannot mix the two.
-    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count) {
+    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count, ubuntu_archive) {
       if (!in_stanza) return
       if (lacks("types")) reject("deb822 stanza at line " stanza_start " lacks Types")
       count = split(fields["types"], types, /[[:space:]]+/)
@@ -231,9 +231,16 @@ add_universe_component() {
         if (lacks("uris")) reject("deb822 stanza at line " stanza_start " lacks URIs")
         if (lacks("suites")) reject("deb822 stanza at line " stanza_start " lacks Suites")
         count = split(fields["uris"], uris, /[[:space:]]+/)
-        for (i = 1; i <= count; i++)
-          if (uris[i] != "" && index(uris[i], ":") == 0)
+        ubuntu_archive = 1
+        for (i = 1; i <= count; i++) {
+          if (uris[i] == "") continue
+          if (index(uris[i], ":") == 0)
             reject("deb822 stanza at line " stanza_start " has URI " q uris[i] q " without " q ":" q)
+          # Every URI must name a known Ubuntu archive. Custom mirrors and
+          # mixed Ubuntu/third-party stanzas retain their original components.
+          if (uris[i] !~ /^https?:\/\/((archive|security)\.ubuntu\.com\/ubuntu|ports\.ubuntu\.com\/ubuntu-ports)\/?$/)
+            ubuntu_archive = 0
+        }
         count = split(fields["suites"], suites, /[[:space:]]+/)
         suite_count = exact_count = 0
         for (i = 1; i <= count; i++) {
@@ -249,7 +256,7 @@ add_universe_component() {
           reject("deb822 stanza at line " stanza_start " lacks Components")
         # Continued Components values were accumulated above; append to the
         # first Components line so continuation lines stay byte-identical.
-        if (exact_count == 0 && !has_universe(fields["components"])) {
+        if (exact_count == 0 && ubuntu_archive && !has_universe(fields["components"])) {
           sub(/[[:space:]]+$/, "", lines[components_line])
           lines[components_line] = lines[components_line] " universe"
           changed = 1
