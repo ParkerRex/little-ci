@@ -215,6 +215,8 @@ add_universe_component() {
       for (i = 1; i <= 4; i++)
         if (fields[names[i]] !~ /[^[:space:]]/)
           reject("deb822 stanza at line " stanza_start " lacks " labels[i])
+      # Continued Components values were accumulated above; append to the
+      # first Components line so continuation lines stay byte-identical.
       if (!has_universe(fields["components"])) {
         sub(/[[:space:]]+$/, "", lines[components_line])
         lines[components_line] = lines[components_line] " universe"
@@ -230,7 +232,6 @@ add_universe_component() {
     /^#/ { next }
     /^[ \t]/ {
       if (current_field == "") reject("malformed deb822 continuation at line " NR)
-      if (current_field == "components") reject("multi-line Components at line " NR " is unsupported")
       fields[current_field] = fields[current_field] " " $0
       next
     }

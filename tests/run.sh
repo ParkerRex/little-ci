@@ -2609,6 +2609,10 @@ test_orbstack_enables_universe_in_existing_deb822_sources() {
       write_main_only_ubuntu_sources "$ubuntu_sources"
       sed -i 's/^Components: main restricted$/Components: main\n restricted/' "$ubuntu_sources"
       ;;
+    multiline-components-with-universe)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's/^Components: main.*$/Components: main\n# comment between continuations\n universe/' "$ubuntu_sources"
+      ;;
     not-regular) mkdir "$ubuntu_sources" ;;
     continued-fields)
       cat > "$ubuntu_sources" <<'SOURCES'
@@ -2670,12 +2674,16 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields)
+    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe)
       assert_status 0 "$status"
       local expected_sources
-      expected_sources="$(sed -e 's/^Components: main$/Components: main universe/' \
-        -e 's/^Components: main restricted$/Components: main restricted universe/' \
-        "$sandbox_dir/ubuntu.sources.before")"
+      if [ "$source_state" = multiline-components-with-universe ]; then
+        expected_sources="$(cat "$sandbox_dir/ubuntu.sources.before")"
+      else
+        expected_sources="$(sed -e 's/^Components: main$/Components: main universe/' \
+          -e 's/^Components: main restricted$/Components: main restricted universe/' \
+          "$sandbox_dir/ubuntu.sources.before")"
+      fi
       [ "$(cat "$ubuntu_sources")" = "$expected_sources" ] || \
         fail "ubuntu.sources not updated exactly: $(diff <(printf '%s\n' "$expected_sources") "$ubuntu_sources" | tr '\n' ' ')"
       # Sources are repaired and validated before any guest apt use.
@@ -3185,7 +3193,8 @@ run_case 'job dependencies load owning config without changing packages' test_jo
 run_case 'OrbStack enables universe in main-only deb822 source before dependencies' test_orbstack_enables_universe_in_existing_deb822_sources main-only
 run_case 'OrbStack leaves deb822 source with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources universe-present
 run_case 'OrbStack rejects deb822 stanza without Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-components 'lacks Components'
-run_case 'OrbStack rejects multi-line deb822 Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components 'multi-line Components'
+run_case 'OrbStack adds universe once to continued deb822 Components' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components
+run_case 'OrbStack leaves continued deb822 Components with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components-with-universe
 run_case 'OrbStack rejects non-regular ubuntu.sources before apt' test_orbstack_enables_universe_in_existing_deb822_sources not-regular 'is not a readable regular file'
 run_case 'OrbStack accepts continued deb822 URIs, Suites, and Signed-By' test_orbstack_enables_universe_in_existing_deb822_sources continued-fields
 run_case 'OrbStack rejects orphan deb822 continuation before apt' test_orbstack_enables_universe_in_existing_deb822_sources orphan-continuation 'malformed deb822 continuation'
