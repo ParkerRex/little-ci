@@ -2665,6 +2665,33 @@ SOURCES
       # missing URIs must still be rejected.
       printf 'Types: deb\nEnabled: %s\nSuites: noble\nComponents: main\n' "${source_state#enabled-token-}" > "$ubuntu_sources"
       ;;
+    duplicate-components)
+      # apt uses the last occurrence of a field, including its continuations.
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: universe\nComponents: main\n' > "$ubuntu_sources"
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: universe\nComponents: main universe\n' > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-continued-components)
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n universe\nComponents: main\n restricted\n' > "$ubuntu_sources"
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n universe\nComponents: main universe\n restricted\n' > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-components-final-universe)
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\nComponents: main\n universe\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-enabled-last-disabled)
+      printf 'Types: deb\nEnabled: yes\nEnabled: no\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-enabled-last-enabled)
+      printf 'Types: deb\nEnabled: no\nSuites: noble\nComponents: main\nEnabled: yes\n' > "$ubuntu_sources"
+      ;;
+    duplicate-uris-last-valid)
+      printf 'Types: deb\nURIs: /srv/old-repo\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n' > "$ubuntu_sources"
+      sed 's/^Components: main$/Components: main universe/' "$ubuntu_sources" > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    duplicate-uris-last-invalid)
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nURIs: /srv/new-repo\nSuites: noble\nComponents: main\n' > "$ubuntu_sources"
+      ;;
     colonless-flat-uri)
       printf 'Types: deb\nURIs: /srv/local-repo\nSuites: ./\n' > "$ubuntu_sources"
       ;;
@@ -2719,10 +2746,12 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros)
+    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid)
       assert_status 0 "$status"
       local expected_sources
-      if [[ "$source_state" =~ ^(multiline-components-with-universe|flat-only|custom-path)$ ]]; then
+      if [ -f "$sandbox_dir/ubuntu.sources.expected" ]; then
+        expected_sources="$(cat "$sandbox_dir/ubuntu.sources.expected")"
+      elif [[ "$source_state" =~ ^(multiline-components-with-universe|flat-only|custom-path)$ ]]; then
         expected_sources="$(cat "$sandbox_dir/ubuntu.sources.before")"
       else
         expected_sources="$(sed -e 's/^Components: main$/Components: main universe/' \
@@ -3254,6 +3283,13 @@ run_case 'OrbStack validates stanza with numeric nonzero Enabled value' test_orb
 run_case 'OrbStack validates stanza with negative Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token--1 'lacks URIs'
 run_case 'OrbStack validates stanza with partially numeric Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x 'lacks URIs'
 run_case 'OrbStack validates stanza with invalid octal Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-08 'lacks URIs'
+run_case 'OrbStack adds universe to final duplicate Components only' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components
+run_case 'OrbStack uses final continued duplicate Components' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-continued-components
+run_case 'OrbStack leaves final duplicate Components with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components-final-universe
+run_case 'OrbStack preserves stanza disabled by final duplicate Enabled' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-enabled-last-disabled
+run_case 'OrbStack validates stanza enabled by final duplicate Enabled' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-enabled-last-enabled 'lacks URIs'
+run_case 'OrbStack accepts final valid duplicate URIs' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-uris-last-valid
+run_case 'OrbStack rejects final invalid duplicate URIs before apt' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-uris-last-invalid "URI '/srv/new-repo' without ':'"
 run_case 'OrbStack rejects enabled flat URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-flat-uri "URI '/srv/local-repo' without ':'"
 run_case 'OrbStack rejects any enabled URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-second-uri "URI '/srv/local-repo' without ':'"
 run_case 'OrbStack rejects unknown Types even in disabled stanza before apt' test_orbstack_enables_universe_in_existing_deb822_sources unknown-disabled-type "unknown Types value 'rpm'"

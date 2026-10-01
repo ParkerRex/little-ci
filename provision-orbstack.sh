@@ -272,7 +272,8 @@ add_universe_component() {
       separator = index($0, ":")
       if (separator < 2) reject("malformed deb822 field at line " NR)
       field_name = tolower(substr($0, 1, separator - 1))
-      if (field_name in fields) reject("duplicate " field_name " field at line " NR)
+      # Like apt, a repeated field replaces the earlier one (with its
+      # continuations); earlier lines are left byte-identical.
       fields[field_name] = substr($0, separator + 1)
       current_field = field_name
       if (!in_stanza) { in_stanza = 1; stanza_start = NR }
