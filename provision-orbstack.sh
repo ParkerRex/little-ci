@@ -2,9 +2,10 @@
 # provision-orbstack.sh — create and prepare Little-CI's OrbStack machine.
 #
 # Run this script on an Apple Silicon Mac. It creates an isolated,
-# network-isolated Ubuntu 24.04 arm64 machine, installs base dependencies, and
-# copies the Little-CI scripts into the machine. Safe to re-run after creation;
-# incompatible existing machines are rejected instead of changed implicitly.
+# network-isolated Ubuntu 24.04 arm64 machine, installs base and CI job
+# dependencies, and copies the Little-CI scripts into the machine. Safe to re-run
+# after creation; incompatible existing machines are rejected instead of changed
+# implicitly.
 
 fail() {
   echo "ERROR: $*" >&2
@@ -57,6 +58,7 @@ initialize_guest_runtime_paths() {
   local runtime_path
   guest_runtime_paths=(
     provision-box.sh
+    provision-job-dependencies.sh
     install-runners.sh
     uninstall-runners.sh
     provision-postgres.sh
@@ -249,6 +251,11 @@ EOF
     "RUNNER_USER=$RUNNER_USER" \
     "RUNNER_COUNT=$RUNNER_COUNT" \
     bash -c 'cd "$1" && ./provision-box.sh' bash "$remote_repo_dir"
+
+  # Runs after the deb822 step because ffmpeg and ripgrep come from universe.
+  echo "== installing CI job dependencies =="
+  orbctl run -m "$ORB_MACHINE" -u root \
+    bash -c 'cd "$1" && ./provision-job-dependencies.sh' bash "$remote_repo_dir"
 
   echo "== $ORB_MACHINE ready =="
   orbctl run -m "$ORB_MACHINE" -u "$RUNNER_USER" bash -lc \

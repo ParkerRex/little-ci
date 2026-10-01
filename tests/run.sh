@@ -2293,7 +2293,301 @@ test_orbstack_transfers_use_explicit_allowlist() {
   assert_file_not_contains "$sandbox_dir/archive-inventory.log" 'tests/'
   assert_file_not_contains "$sandbox_dir/archive-inventory.log" 'examples/'
   assert_file_contains "$sandbox_dir/archive-inventory.log" 'provision-box.sh'
+  assert_file_contains "$sandbox_dir/archive-inventory.log" 'provision-job-dependencies.sh'
   assert_file_contains "$sandbox_dir/archive-inventory.log" 'uninstall-runners.sh'
+}
+
+# Ubuntu packages Little Worker's trusted read-only jobs need. The Playwright
+# entries are the v1.59.1 `install-deps chromium` set for ubuntu24.04 (the
+# chromium group plus the tools group it always adds), kept independent of the
+# script so a drifted copy fails here.
+expected_job_dependency_packages=(
+  ffmpeg ripgrep
+  libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2
+  libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 libnspr4 libnss3
+  libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6
+  libxfixes3 libxkbcommon0 libxrandr2
+  xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6
+  xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic
+  fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
+)
+
+install_job_dependency_mocks() {
+  local dpkg_architecture="$1"
+  local os_version_id="${2:-24.04}"
+
+  printf 'ID=ubuntu\nVERSION_ID="%s"\nVERSION_CODENAME=noble\n' "$os_version_id" \
+    > "$sandbox_dir/os-release"
+  : > "$sandbox_dir/installed-packages"
+
+  cat > "$sandbox_dir/bin/id" <<'MOCK'
+#!/usr/bin/env bash
+[ "${1:-}" = -u ] && [ "$#" -eq 1 ] && { printf '%s\n' "${MOCK_EFFECTIVE_UID:-0}"; exit 0; }
+/usr/bin/id "$@"
+MOCK
+  cat > "$sandbox_dir/bin/dpkg" <<MOCK
+#!/usr/bin/env bash
+[ "\${1:-}" = --print-architecture ] && { printf '%s\\n' '$dpkg_architecture'; exit 0; }
+exit 64
+MOCK
+  cat > "$sandbox_dir/bin/dpkg-query" <<'MOCK'
+#!/usr/bin/env bash
+package_name="${!#}"
+grep -Fqx -- "$package_name" "${MOCK_INSTALLED_PACKAGES:?}" || {
+  printf 'dpkg-query: no packages found matching %s\n' "$package_name" >&2
+  exit 1
+}
+printf 'installed'
+MOCK
+  cat > "$sandbox_dir/bin/apt-get" <<'MOCK'
+#!/usr/bin/env bash
+printf 'apt-get' >> "${MOCK_COMMAND_LOG:?}"
+printf ' %q' "$@" >> "$MOCK_COMMAND_LOG"
+printf ' DEBIAN_FRONTEND=%q\n' "${DEBIAN_FRONTEND:-}" >> "$MOCK_COMMAND_LOG"
+[ "${1:-}" = install ] || exit 0
+[ "${MOCK_APT_INSTALL_STATUS:-0}" -eq 0 ] || exit "$MOCK_APT_INSTALL_STATUS"
+[ "${MOCK_APT_RECORDS_INSTALL:-1}" = 1 ] || exit 0
+for argument in "$@"; do
+  case "$argument" in
+    install|-*) ;;
+    *) printf '%s\n' "$argument" >> "${MOCK_INSTALLED_PACKAGES:?}" ;;
+  esac
+done
+MOCK
+  for command_name in ffmpeg rg; do
+    cat > "$sandbox_dir/bin/$command_name" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >> "${MOCK_COMMAND_LOG:?}"
+printf '%s version mock\n' "$(basename "$0")"
+MOCK
+  done
+  # Fail loudly if provisioning reaches for browser or runtime downloads.
+  for command_name in curl wget npx npm node bun playwright snap; do
+    cat > "$sandbox_dir/bin/$command_name" <<'MOCK'
+#!/usr/bin/env bash
+printf 'FORBIDDEN %s %s\n' "$(basename "$0")" "$*" >> "${MOCK_COMMAND_LOG:?}"
+exit 97
+MOCK
+  done
+  chmod +x "$sandbox_dir/bin/"*
+}
+
+run_job_dependency_provisioner() {
+  cd "$sandbox_dir/repo" &&
+    PATH="$sandbox_dir/bin:$PATH" \
+    MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+    MOCK_INSTALLED_PACKAGES="$sandbox_dir/installed-packages" \
+    LITTLE_CI_OS_RELEASE_FILE="$sandbox_dir/os-release" \
+    LITTLE_CI_NEEDRESTART_CONF_DIR="$sandbox_dir/needrestart-conf.d" \
+    ./provision-job-dependencies.sh 2>&1
+}
+
+test_job_dependencies_install_exact_ubuntu_packages() {
+  local dpkg_architecture="$1"
+  new_sandbox
+  install_job_dependency_mocks "$dpkg_architecture"
+  printf 'ripgrep\nlibnss3\n' > "$sandbox_dir/installed-packages"
+
+  local output status install_line expected_missing actual_requested package_name
+  set +e
+  output="$(run_job_dependency_provisioner)"
+  status=$?
+  set -e
+  assert_status 0 "$status"
+  assert_file_contains "$sandbox_dir/command.log" 'apt-get update DEBIAN_FRONTEND=noninteractive'
+  assert_file_order "$sandbox_dir/command.log" 'apt-get update' 'apt-get install'
+  install_line="$(grep -F 'apt-get install' "$sandbox_dir/command.log")"
+  [ "$(grep -c -F 'apt-get install' "$sandbox_dir/command.log")" -eq 1 ] || \
+    fail 'expected exactly one apt-get install'
+  assert_contains "$install_line" 'apt-get install -y --no-install-recommends '
+  assert_contains "$install_line" 'DEBIAN_FRONTEND=noninteractive'
+
+  expected_missing="$(printf '%s\n' "${expected_job_dependency_packages[@]}" | grep -Fvx -e ripgrep -e libnss3 | sort)"
+  actual_requested="$(
+    sed -e 's/^apt-get install -y --no-install-recommends //' -e 's/ DEBIAN_FRONTEND=.*$//' <<< "$install_line" |
+      tr ' ' '\n' | sort
+  )"
+  [ "$actual_requested" = "$expected_missing" ] || \
+    fail "requested packages differ from the Playwright/job set: $(diff <(printf '%s\n' "$expected_missing") <(printf '%s\n' "$actual_requested") | tr '\n' ' ')"
+
+  for package_name in "${expected_job_dependency_packages[@]}"; do
+    grep -Fqx -- "$package_name" "$sandbox_dir/installed-packages" || fail "not installed: $package_name"
+  done
+  assert_file_contains "$sandbox_dir/command.log" 'ffmpeg -version'
+  assert_file_contains "$sandbox_dir/command.log" 'rg --version'
+  assert_file_not_contains "$sandbox_dir/command.log" 'FORBIDDEN'
+  assert_file_contains "$sandbox_dir/needrestart-conf.d/actions_runner_services.conf" \
+    '$nrconf{override_rc}{qr(^actions\.runner\..+\.service$)} = 0;'
+  assert_contains "$output" 'CI job dependencies ready'
+}
+
+test_job_dependencies_rerun_skips_apt_when_installed() {
+  new_sandbox
+  install_job_dependency_mocks arm64
+  printf '%s\n' "${expected_job_dependency_packages[@]}" > "$sandbox_dir/installed-packages"
+
+  local output status
+  set +e
+  output="$(run_job_dependency_provisioner)"
+  status=$?
+  set -e
+  assert_status 0 "$status"
+  assert_file_not_contains "$sandbox_dir/command.log" 'apt-get'
+  assert_file_contains "$sandbox_dir/command.log" 'ffmpeg -version'
+  assert_file_contains "$sandbox_dir/command.log" 'rg --version'
+  assert_contains "$output" 'already installed'
+  assert_contains "$output" 'CI job dependencies ready'
+}
+
+test_job_dependencies_reject_unsupported_host_before_apt() {
+  local rejected_condition="$1" expected_message="$2"
+  new_sandbox
+  case "$rejected_condition" in
+    release) install_job_dependency_mocks arm64 22.04 ;;
+    architecture) install_job_dependency_mocks armhf ;;
+    non-root) install_job_dependency_mocks arm64 ;;
+    distribution)
+      install_job_dependency_mocks arm64
+      printf 'ID=debian\nVERSION_ID="12"\n' > "$sandbox_dir/os-release"
+      ;;
+  esac
+
+  local output status
+  set +e
+  if [ "$rejected_condition" = non-root ]; then
+    output="$(MOCK_EFFECTIVE_UID=1000 run_job_dependency_provisioner)"
+  else
+    output="$(run_job_dependency_provisioner)"
+  fi
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "unsupported $rejected_condition unexpectedly accepted"
+  assert_contains "$output" "$expected_message"
+  assert_file_not_contains "$sandbox_dir/command.log" 'apt-get'
+  [ ! -e "$sandbox_dir/needrestart-conf.d" ] || fail 'needrestart policy written before validation'
+}
+
+test_job_dependencies_fail_when_apt_or_verification_fails() {
+  local failure_mode="$1"
+  new_sandbox
+  install_job_dependency_mocks arm64
+
+  local output status
+  set +e
+  if [ "$failure_mode" = apt ]; then
+    output="$(MOCK_APT_INSTALL_STATUS=100 run_job_dependency_provisioner)"
+  else
+    output="$(MOCK_APT_RECORDS_INSTALL=0 run_job_dependency_provisioner)"
+  fi
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "dependency $failure_mode failure unexpectedly succeeded"
+  assert_file_contains "$sandbox_dir/command.log" 'apt-get install'
+  [[ "$output" != *'CI job dependencies ready'* ]] || fail 'reported ready after failure'
+  if [ "$failure_mode" = verification ]; then
+    assert_contains "$output" 'still missing after apt-get install: ffmpeg'
+  fi
+}
+
+test_job_dependencies_load_owning_config_without_changing_packages() {
+  new_sandbox
+  install_job_dependency_mocks amd64
+  mkdir -p "$sandbox_dir/elsewhere"
+  # The owning checkout's trusted config is loaded, but it must not be able to
+  # replace the fixed package authority, even by assigning its variable names.
+  cat > "$sandbox_dir/repo/config.env" <<'CONFIG'
+printf 'owning\n' >> "${CONFIG_LOAD_LOG:?}"
+job_tool_packages=(config-supplied-package)
+playwright_chromium_packages=()
+playwright_tools_packages=()
+CONFIG
+  printf "printf 'cwd\\\\n' >> \"\${CONFIG_LOAD_LOG:?}\"\n" > "$sandbox_dir/elsewhere/config.env"
+
+  local output status install_line expected_packages actual_requested
+  set +e
+  output="$(
+    cd "$sandbox_dir/elsewhere" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_INSTALLED_PACKAGES="$sandbox_dir/installed-packages" \
+      CONFIG_LOAD_LOG="$sandbox_dir/config-load.log" \
+      LITTLE_CI_OS_RELEASE_FILE="$sandbox_dir/os-release" \
+      LITTLE_CI_NEEDRESTART_CONF_DIR="$sandbox_dir/needrestart-conf.d" \
+      "$sandbox_dir/repo/provision-job-dependencies.sh" 2>&1
+  )"
+  status=$?
+  set -e
+  assert_status 0 "$status"
+  [ "$(cat "$sandbox_dir/config-load.log" 2>/dev/null)" = owning ] || \
+    fail "expected only the owning checkout config to load; got: $(tr '\n' ' ' < "$sandbox_dir/config-load.log" 2>/dev/null)"
+  install_line="$(grep -F 'apt-get install' "$sandbox_dir/command.log")"
+  assert_file_not_contains "$sandbox_dir/command.log" 'config-supplied-package'
+  expected_packages="$(printf '%s\n' "${expected_job_dependency_packages[@]}" | sort)"
+  actual_requested="$(
+    sed -e 's/^apt-get install -y --no-install-recommends //' -e 's/ DEBIAN_FRONTEND=.*$//' <<< "$install_line" |
+      tr ' ' '\n' | sort
+  )"
+  [ "$actual_requested" = "$expected_packages" ] || fail 'config.env changed the required package list'
+  assert_contains "$output" 'CI job dependencies ready'
+
+  # Like every other script, the owning config must not persist GitHub credentials.
+  printf 'GH_TOKEN=do-not-leak-config-token\n' >> "$sandbox_dir/repo/config.env"
+  : > "$sandbox_dir/command.log"
+  set +e
+  output="$(
+    cd "$sandbox_dir/elsewhere" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_INSTALLED_PACKAGES="$sandbox_dir/installed-packages" \
+      CONFIG_LOAD_LOG="$sandbox_dir/config-load.log" \
+      LITTLE_CI_OS_RELEASE_FILE="$sandbox_dir/os-release" \
+      LITTLE_CI_NEEDRESTART_CONF_DIR="$sandbox_dir/needrestart-conf.d" \
+      "$sandbox_dir/repo/provision-job-dependencies.sh" 2>&1
+  )"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail 'config.env with a persisted GitHub token was accepted'
+  assert_contains "$output" 'config.env must not contain GitHub credentials'
+  assert_file_not_contains "$sandbox_dir/command.log" 'apt-get'
+  case "$output" in
+    *do-not-leak-config-token*) fail 'persisted config token leaked to output' ;;
+  esac
+}
+
+test_orbstack_provisioning_installs_job_dependencies_in_guest() {
+  new_sandbox
+  install_uname_mock arm64
+  install_orbctl_machine_mock
+  : > "$sandbox_dir/orbctl-stdin.log"
+
+  local status
+  set +e
+  (
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_ORBCTL_STDIN_LOG="$sandbox_dir/orbctl-stdin.log" \
+      MOCK_MACHINE_EXISTS=1 \
+      MOCK_MACHINE_NAME=little-ci-acme-widget-studio \
+      MOCK_ORB_INFO='{"record":{"name":"little-ci-acme-widget-studio","state":"running","image":{"distro":"ubuntu","version":"noble","arch":"arm64"},"config":{"isolated":true,"isolate_network":true,"forward_ssh_agent":false,"default_username":"deploy","cpu_limit":2,"memory_limit_mib":4096,"disk_limit_bytes":51539607552}}}' \
+      MOCK_ORB_IDENTITY=$'machine=little-ci-acme-widget-studio\nscope=repository\ntarget=acme/widget\nprefix=little-ci-acme-widget-studio\nuser=deploy\nhome=/home/deploy' \
+      GITHUB_SCOPE=repository \
+      GITHUB_URL=https://github.com/acme/widget \
+      FLEET_ID=studio \
+      ./provision-orbstack.sh >/dev/null 2>&1
+  )
+  status=$?
+  set -e
+  assert_status 0 "$status"
+  # The job set needs Ubuntu universe, so it must follow the deb822 source step
+  # (the last stdin script) and the explicit runtime copy.
+  assert_file_contains "$sandbox_dir/orbctl-stdin.log" 'Components: main restricted universe multiverse'
+  assert_file_contains "$sandbox_dir/command.log" '-u root bash -c cd\ \"\$1\"\ \&\&\ ./provision-job-dependencies.sh bash /home/deploy/little-ci'
+  assert_file_order "$sandbox_dir/command.log" 'tar -xzf - -C /home/deploy/little-ci' './provision-job-dependencies.sh'
+  assert_file_order "$sandbox_dir/command.log" 'orbctl run -m little-ci-acme-widget-studio -u root bash -s ORBENV' './provision-job-dependencies.sh'
+  assert_file_not_contains "$sandbox_dir/command.log" '-u deploy bash -c cd\ \"\$1\"\ \&\&\ ./provision-job-dependencies.sh'
+  assert_file_not_contains "$sandbox_dir/orbctl-stdin.log" 'playwright install'
+  assert_file_not_contains "$sandbox_dir/orbctl-stdin.log" 'sudoers.d/deploy'
 }
 
 test_local_uninstall_uses_remove_token_and_deletes_selected_runner() {
@@ -2738,6 +3032,17 @@ run_case 'OrbStack install rejects guest UID 0 before token' test_orbstack_insta
 run_case 'OrbStack install rejects Mac mounts before start' test_orbstack_install_rejects_mac_mount_before_start
 run_case 'OrbStack install rejects unverifiable mount configuration' test_orbstack_install_rejects_mac_mount_before_start '' 72 'could not verify configured mounts'
 run_case 'OrbStack transfers use an explicit file allowlist' test_orbstack_transfers_use_explicit_allowlist
+run_case 'job dependencies install exact Ubuntu 24.04 arm64 packages' test_job_dependencies_install_exact_ubuntu_packages arm64
+run_case 'job dependencies install exact Ubuntu 24.04 amd64 packages' test_job_dependencies_install_exact_ubuntu_packages amd64
+run_case 'job dependency rerun skips apt when installed' test_job_dependencies_rerun_skips_apt_when_installed
+run_case 'job dependencies reject Ubuntu 22.04 before apt' test_job_dependencies_reject_unsupported_host_before_apt release 'requires Ubuntu 24.04'
+run_case 'job dependencies reject non-Ubuntu before apt' test_job_dependencies_reject_unsupported_host_before_apt distribution 'requires Ubuntu 24.04'
+run_case 'job dependencies reject unsupported architecture before apt' test_job_dependencies_reject_unsupported_host_before_apt architecture 'arm64 or amd64'
+run_case 'job dependencies require root before apt' test_job_dependencies_reject_unsupported_host_before_apt non-root 'must run as root'
+run_case 'job dependencies fail on apt install failure' test_job_dependencies_fail_when_apt_or_verification_fails apt
+run_case 'job dependencies fail when packages remain missing' test_job_dependencies_fail_when_apt_or_verification_fails verification
+run_case 'job dependencies load owning config without changing packages' test_job_dependencies_load_owning_config_without_changing_packages
+run_case 'OrbStack provisioning installs job dependencies in guest as root' test_orbstack_provisioning_installs_job_dependencies_in_guest
 run_case 'local uninstall unregisters and removes the selected runner' test_local_uninstall_uses_remove_token_and_deletes_selected_runner
 run_case 'local uninstall rejects RUNNER_HOME=/ before commands' test_local_uninstall_rejects_root_runner_home_before_commands
 run_case 'unselected malformed runner does not block exact removal' test_unselected_malformed_runner_does_not_block_removal_mode runner
