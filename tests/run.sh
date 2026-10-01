@@ -2652,6 +2652,19 @@ SOURCES
     mixed-suite-kinds)
       printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./ noble\nComponents: main\n' > "$ubuntu_sources"
       ;;
+    disabled-numeric-zeros)
+      # apt StringToBool: a whole-value strtol(..., 0) result of 0 is false.
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      # Ubuntu 24.04 glibc strtol also accepts the C23 0b binary prefix.
+      for enabled_value in 00 +0 -0 0x0 0X00 0b0; do
+        printf '\nTypes: deb\nEnabled: %s\n' "$enabled_value" >> "$ubuntu_sources"
+      done
+      ;;
+    enabled-token-*)
+      # Nonzero or partially parsed numbers leave the stanza enabled, so its
+      # missing URIs must still be rejected.
+      printf 'Types: deb\nEnabled: %s\nSuites: noble\nComponents: main\n' "${source_state#enabled-token-}" > "$ubuntu_sources"
+      ;;
     colonless-flat-uri)
       printf 'Types: deb\nURIs: /srv/local-repo\nSuites: ./\n' > "$ubuntu_sources"
       ;;
@@ -2706,7 +2719,7 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza)
+    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros)
       assert_status 0 "$status"
       local expected_sources
       if [[ "$source_state" =~ ^(multiline-components-with-universe|flat-only|custom-path)$ ]]; then
@@ -3236,6 +3249,11 @@ run_case 'OrbStack adds universe only to archive stanzas beside flat stanza' tes
 run_case 'OrbStack preserves disabled deb822 stanzas byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources disabled-stanza
 run_case 'OrbStack rejects exact-path Suite with Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources exact-path-with-components 'exact-path Suites must omit Components'
 run_case 'OrbStack rejects mixed exact-path and archive Suites before apt' test_orbstack_enables_universe_in_existing_deb822_sources mixed-suite-kinds 'mixes exact-path and archive Suites'
+run_case 'OrbStack preserves stanzas disabled by numeric zero Enabled values' test_orbstack_enables_universe_in_existing_deb822_sources disabled-numeric-zeros
+run_case 'OrbStack validates stanza with numeric nonzero Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x1 'lacks URIs'
+run_case 'OrbStack validates stanza with negative Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token--1 'lacks URIs'
+run_case 'OrbStack validates stanza with partially numeric Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x 'lacks URIs'
+run_case 'OrbStack validates stanza with invalid octal Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-08 'lacks URIs'
 run_case 'OrbStack rejects enabled flat URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-flat-uri "URI '/srv/local-repo' without ':'"
 run_case 'OrbStack rejects any enabled URI without colon before apt' test_orbstack_enables_universe_in_existing_deb822_sources colonless-second-uri "URI '/srv/local-repo' without ':'"
 run_case 'OrbStack rejects unknown Types even in disabled stanza before apt' test_orbstack_enables_universe_in_existing_deb822_sources unknown-disabled-type "unknown Types value 'rpm'"

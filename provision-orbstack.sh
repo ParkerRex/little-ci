@@ -225,7 +225,9 @@ add_universe_component() {
           reject("deb822 stanza at line " stanza_start " has unknown Types value " q types[i] q)
       enabled = tolower(fields["enabled"])
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", enabled)
-      if (enabled !~ /^(0|no|false|without|off|disable)$/) {
+      # apt StringToBool: false words, or a whole value strtol(..., 0) reads
+      # as zero (octal, 0x hex, or Ubuntu 24.04 glibc 0b binary; optional sign).
+      if (enabled !~ /^([+-]?(0+|0x0+|0b0+)|no|false|without|off|disable)$/) {
         if (lacks("uris")) reject("deb822 stanza at line " stanza_start " lacks URIs")
         if (lacks("suites")) reject("deb822 stanza at line " stanza_start " lacks Suites")
         count = split(fields["uris"], uris, /[[:space:]]+/)
