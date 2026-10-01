@@ -324,10 +324,8 @@ trap - EXIT
   exit 1
 }
 
-if [ -s "$apt_sources_list" ]; then
-  mv "$apt_sources_list" "$apt_sources_list.distrobuilder.bak"
-  : > "$apt_sources_list"
-fi
+# An existing deb822 file may contain no active Ubuntu binary archive.
+# Preserve the classic list, which may still be the machine's only source.
 EOF
 
   echo "== installing base packages and Docker =="

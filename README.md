@@ -385,13 +385,14 @@ older Little-CI release is missing; it does not upgrade packages that are
 already installed. Before any guest apt command, it adds `universe` to any
 enabled archive-style stanza (one whose `Suites` take `Components`) in an
 existing `/etc/apt/sources.list.d/ubuntu.sources` that omits it, preserving that
-file's other lines and every other apt source. Exact-path stanzas (every suite
+file's other lines and every other apt source, including the classic
+`/etc/apt/sources.list` when it supplies the active archive. Exact-path stanzas (every suite
 ends in `/`, such as `./`, with no `Components`) and stanzas apt treats as
 disabled (`Enabled: no`) stay byte-identical. Indented continuation lines are
 accepted for every field; a continued `Components` field gains `universe` on its
 first line only when no line already lists it. An unreadable, non-regular, or
 malformed `ubuntu.sources` stops provisioning before apt runs: for example, an
-orphan continuation line, a stanza without `Types` or with a `Types` value other
+stanza without `Types` or with a `Types` value other
 than `deb` or `deb-src`, an enabled stanza without `URIs` or `Suites` or with a
 URI lacking `:` (such as a bare `/srv/repo` instead of `file:/srv/repo`), an
 archive stanza without `Components`, or an exact-path suite combined with

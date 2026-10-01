@@ -2588,7 +2588,8 @@ test_orbstack_enables_universe_in_existing_deb822_sources() {
   install_uname_mock arm64
   install_orbctl_machine_mock
   mkdir -p "$sandbox_dir/apt/sources.list.d"
-  : > "$sandbox_dir/apt/sources.list"
+  printf 'deb http://ports.ubuntu.com/ubuntu-ports noble main universe\n' > "$sandbox_dir/apt/sources.list"
+  cp "$sandbox_dir/apt/sources.list" "$sandbox_dir/sources.list.before"
   : > "$sandbox_dir/orbctl-stdin.log"
   local ubuntu_sources="$sandbox_dir/apt/sources.list.d/ubuntu.sources"
   local other_sources="$sandbox_dir/apt/sources.list.d/docker.sources"
@@ -2760,6 +2761,7 @@ MOCK
   status=$?
   set -e
   cmp -s "$other_sources" "$sandbox_dir/docker.sources.before" || fail 'unrelated apt source was modified'
+  cmp -s "$sandbox_dir/apt/sources.list" "$sandbox_dir/sources.list.before" || fail 'active classic apt source was removed or modified'
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
