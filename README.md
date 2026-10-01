@@ -39,8 +39,9 @@ gh auth status
 orbctl version
 ```
 
-For a generic Linux host, use Ubuntu 24.04 with systemd, a non-root runner user,
-`sudo`, and Docker access if workflows build or run containers.
+For a generic Linux host, use Ubuntu 24.04 arm64 or x64 with systemd, Ubuntu's
+`universe` package component enabled, a non-root runner user, `sudo`, and Docker
+access if workflows build or run containers.
 
 ## Quick start on a Mac
 
@@ -259,6 +260,20 @@ fleet-qualified `/swapfile-<prefix>-<runner-number>` files, records ownership in
 `/var/lib/little-ci/fleets/<prefix>/managed-swapfiles`, and sets low swappiness.
 It skips swapfile creation in OrbStack.
 
+`provision-job-dependencies.sh` runs as root inside Ubuntu 24.04 arm64 or amd64
+and installs the system packages trusted jobs commonly expect: `ffmpeg`,
+`ripgrep` (`rg`), and exactly the Ubuntu packages that Playwright v1.63.0's
+`playwright install-deps chromium` installs (its `chromium` and `tools` groups:
+Chromium shared libraries, `xvfb`, and fonts). It uses
+`apt-get install --no-install-recommends`, skips apt entirely when every package
+is already installed, and fails if any package is still missing afterwards. It
+does not download Chromium, Node.js, Bun, or Playwright; jobs still install their
+own pinned Playwright and browser build. The package list is release-specific, so
+it refuses other Ubuntu releases and architectures. `provision-orbstack.sh` runs
+it after enabling the `universe` component that `ffmpeg` and `ripgrep` come from.
+It also writes the same `needrestart` runner-service policy described below
+before installing packages, so generic hosts get that protection too.
+
 `install-runners-orb.sh` runs on macOS. It copies the current checkout to the
 isolated guest without relying on a Mac filesystem mount, obtains or forwards a
 short-lived registration token, and invokes `install-runners.sh`. Service install
@@ -266,9 +281,10 @@ is performed through the Mac wrapper as root; the OrbStack guest does not retain
 a passwordless-sudo grant for the runner user.
 
 Mac-to-guest transfer is an explicit runtime allowlist, not a copy of the whole
-checkout. Provisioning sends the guest provision/install/uninstall/Postgres
-scripts and their two `lib/` helpers; installation sends only its guest installer
-and GitHub-target helper. Both include `config.env` when present. They do not send
+checkout. Provisioning sends the guest provision, job-dependency, install,
+uninstall, and Postgres scripts and their two `lib/` helpers; installation sends
+only its guest installer and GitHub-target helper. Both include `config.env` when
+present. They do not send
 docs, tests, examples, `.git`, runner credentials/workspaces, archives, or
 arbitrary untracked files. Keep `config.env` limited to the documented local
 settings; GitHub credentials are rejected and tokens travel only through the
@@ -363,7 +379,10 @@ differs from the bootstrap pin. Little-CI does not automate Ubuntu distribution
 upgrades; treat guest OS upgrades as explicit administrator maintenance, then run
 provision, doctor, and health checks again.
 
-Re-run `provision-orbstack.sh` after changing compatible host configuration.
+Re-run `provision-orbstack.sh` after changing compatible host configuration. A
+re-run also installs any CI job dependencies that a machine provisioned by an
+older Little-CI release is missing; it does not upgrade packages that are
+already installed.
 Resource settings are part of strict machine validation, so changing
 `ORB_CPUS`, `ORB_MEMORY`, or `ORB_DISK` requires changing the existing OrbStack
 machine settings to match before provisioning will continue.
@@ -631,6 +650,7 @@ Copy Little-CI and `config.env` to the server, then run:
 
 ```bash
 sudo ./provision-box.sh
+sudo ./provision-job-dependencies.sh
 export REGTOKEN="$(gh api --method POST \
   /repos/OWNER/REPO/actions/runners/registration-token --jq .token)"
 sudo -u deploy -H --preserve-env=REGTOKEN ./install-runners.sh
