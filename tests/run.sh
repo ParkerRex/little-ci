@@ -2627,9 +2627,18 @@ Signed-By:
  /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
       ;;
-    orphan-continuation)
-      write_main_only_ubuntu_sources "$ubuntu_sources"
-      printf '\n http://ports.ubuntu.com/ubuntu-ports/\nTypes: deb\n' >> "$ubuntu_sources"
+    field-name-whitespace)
+      printf 'Types : deb\nURIs\t: http://ports.ubuntu.com/ubuntu-ports/\nSuites  : noble\nComponents \t: main\nEnabled\t : yes\n\nTypes : deb-src\nEnabled \t: no\n' > "$ubuntu_sources"
+      printf 'Types : deb\nURIs\t: http://ports.ubuntu.com/ubuntu-ports/\nSuites  : noble\nComponents \t: main universe\nEnabled\t : yes\n\nTypes : deb-src\nEnabled \t: no\n' > "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    leading-indented-preamble)
+      printf ' # indented comment before the first field\n\tignored preamble\n' > "$ubuntu_sources"
+      write_main_only_ubuntu_sources "$sandbox_dir/archive.sources"
+      cat "$sandbox_dir/archive.sources" >> "$ubuntu_sources"
+      printf '\n http://ports.ubuntu.com/ubuntu-ports/\nTypes: deb\nURIs: file:/srv/local-repo\nSuites: ./\n' >> "$ubuntu_sources"
+      ;;
+    leading-indented-incomplete-stanza)
+      printf ' # ignored preamble\nTypes: deb\n' > "$ubuntu_sources"
       ;;
     flat-only)
       printf 'Types: deb\nURIs: file:/srv/local-repo\nSuites: ./\nTrusted: yes\n' > "$ubuntu_sources"
@@ -2754,7 +2763,7 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|universe-present|continued-fields|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources)
+    main-only|universe-present|continued-fields|field-name-whitespace|leading-indented-preamble|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources)
       assert_status 0 "$status"
       local expected_sources
       if [ -f "$sandbox_dir/ubuntu.sources.expected" ]; then
@@ -3282,7 +3291,9 @@ run_case 'OrbStack adds universe once to continued deb822 Components' test_orbst
 run_case 'OrbStack leaves continued deb822 Components with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components-with-universe
 run_case 'OrbStack rejects non-regular ubuntu.sources before apt' test_orbstack_enables_universe_in_existing_deb822_sources not-regular 'is not a readable regular file'
 run_case 'OrbStack accepts continued deb822 URIs, Suites, and Signed-By' test_orbstack_enables_universe_in_existing_deb822_sources continued-fields
-run_case 'OrbStack rejects orphan deb822 continuation before apt' test_orbstack_enables_universe_in_existing_deb822_sources orphan-continuation 'malformed deb822 continuation'
+run_case 'OrbStack accepts whitespace before deb822 field colons' test_orbstack_enables_universe_in_existing_deb822_sources field-name-whitespace
+run_case 'OrbStack preserves ignored indented preambles before deb822 fields' test_orbstack_enables_universe_in_existing_deb822_sources leading-indented-preamble
+run_case 'OrbStack rejects incomplete active deb822 stanza after indented preamble' test_orbstack_enables_universe_in_existing_deb822_sources leading-indented-incomplete-stanza 'lacks URIs'
 run_case 'OrbStack preserves flat ./ deb822 stanza without Components' test_orbstack_enables_universe_in_existing_deb822_sources flat-only
 run_case 'OrbStack preserves exact-path deb822 Suite with trailing slash' test_orbstack_enables_universe_in_existing_deb822_sources custom-path
 run_case 'OrbStack adds universe only to archive stanzas beside flat stanza' test_orbstack_enables_universe_in_existing_deb822_sources mixed-flat-and-archive

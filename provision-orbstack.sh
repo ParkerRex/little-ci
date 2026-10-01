@@ -263,6 +263,7 @@ add_universe_component() {
     /^[[:space:]]*$/ { finish_stanza(); next }
     /^#/ { next }
     /^[ \t]/ {
+      if (!in_stanza) next
       if (current_field == "") reject("malformed deb822 continuation at line " NR)
       fields[current_field] = fields[current_field] " " $0
       next
@@ -271,6 +272,7 @@ add_universe_component() {
       separator = index($0, ":")
       if (separator < 2) reject("malformed deb822 field at line " NR)
       field_name = tolower(substr($0, 1, separator - 1))
+      sub(/[[:space:]]+$/, "", field_name)
       # Like apt, a repeated field replaces the earlier one (with its
       # continuations); earlier lines are left byte-identical.
       fields[field_name] = substr($0, separator + 1)
