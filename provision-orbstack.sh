@@ -211,14 +211,14 @@ add_universe_component() {
     function lacks(field_name) {
       return fields[field_name] !~ /[^[:space:]]/
     }
-    # Mirrors apt 2.7 deb822 rules: every stanza needs Types limited to deb
-    # and deb-src; a stanza whose Enabled value is false is otherwise ignored;
+    # Mirrors apt 2.7 deb822 rules: every stanza needs a Types field limited to
+    # deb and deb-src; empty Types or false Enabled make a stanza inert;
     # enabled stanzas need URIs that each contain ":" and Suites; exact-path
     # Suites (ending in /) must omit Components, other Suites require it, and
     # one stanza cannot mix the two.
-    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count, ubuntu_archive) {
+    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count, ubuntu_archive, archive_uri) {
       if (!in_stanza) return
-      if (lacks("types")) reject("deb822 stanza at line " stanza_start " lacks Types")
+      if (!("types" in fields)) reject("deb822 stanza at line " stanza_start " lacks Types")
       count = split(fields["types"], types, /[[:space:]]+/)
       for (i = 1; i <= count; i++)
         if (types[i] != "" && types[i] != "deb" && types[i] != "deb-src")
@@ -227,7 +227,7 @@ add_universe_component() {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", enabled)
       # apt StringToBool: false words, or a whole value strtol(..., 0) reads
       # as zero (octal, 0x hex, or Ubuntu 24.04 glibc 0b binary; optional sign).
-      if (enabled !~ /^([+-]?(0+|0x0+|0b0+)|no|false|without|off|disable)$/) {
+      if (!lacks("types") && enabled !~ /^([+-]?(0+|0x0+|0b0+)|no|false|without|off|disable)$/) {
         if (lacks("uris")) reject("deb822 stanza at line " stanza_start " lacks URIs")
         if (lacks("suites")) reject("deb822 stanza at line " stanza_start " lacks Suites")
         count = split(fields["uris"], uris, /[[:space:]]+/)
@@ -238,7 +238,11 @@ add_universe_component() {
             reject("deb822 stanza at line " stanza_start " has URI " q uris[i] q " without " q ":" q)
           # Every URI must name a known Ubuntu archive. Custom mirrors and
           # mixed Ubuntu/third-party stanzas retain their original components.
-          if (uris[i] !~ /^https?:\/\/((archive|security)\.ubuntu\.com\/ubuntu|ports\.ubuntu\.com\/ubuntu-ports)\/?$/)
+          # Fold hostname case only for comparison, preserving the path and text.
+          archive_uri = uris[i]
+          if (match(archive_uri, /^https?:\/\/[^\/]+/))
+            archive_uri = tolower(substr(archive_uri, 1, RLENGTH)) substr(archive_uri, RLENGTH + 1)
+          if (archive_uri !~ /^https?:\/\/((archive|security)\.ubuntu\.com\/ubuntu|ports\.ubuntu\.com\/ubuntu-ports)\/?$/)
             ubuntu_archive = 0
         }
         count = split(fields["suites"], suites, /[[:space:]]+/)

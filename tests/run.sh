@@ -2615,6 +2615,23 @@ test_orbstack_enables_universe_in_existing_deb822_sources() {
         printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
       done
       ;;
+    archive-hostname-case|archive-path-case)
+      local archive_uri
+      if [ "$source_state" = archive-hostname-case ]; then
+        for archive_uri in http://ARCHIVE.Ubuntu.COM/ubuntu https://Security.UBUNTU.com/ubuntu/ \
+          https://PORTS.ubuntu.COM/ubuntu-ports; do
+          printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+        done
+        sed 's/^Components: main$/Components: main universe/' "$ubuntu_sources" > "$sandbox_dir/ubuntu.sources.expected"
+      else
+        for archive_uri in http://ARCHIVE.ubuntu.com/Ubuntu https://SECURITY.ubuntu.com/UBUNTU/ \
+          https://PORTS.ubuntu.com/Ubuntu-ports \
+          'http://ports.ubuntu.com/ubuntu-ports https://PORTS.ubuntu.com/Ubuntu-ports'; do
+          printf 'Types: deb\nURIs: %s\nSuites: noble\nComponents: main\n\n' "$archive_uri" >> "$ubuntu_sources"
+        done
+        cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      fi
+      ;;
     ubuntu-and-third-party-stanzas)
       printf 'Types: deb\nURIs: https://packages.example\nSuites: noble\nComponents: main\n\n' > "$ubuntu_sources"
       cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
@@ -2705,6 +2722,13 @@ SOURCES
       : > "$ubuntu_sources"
       cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
       ;;
+    empty-types)
+      printf 'Types: \t\n' > "$ubuntu_sources"
+      cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
+      ;;
+    missing-types)
+      printf 'URIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble\nComponents: main\n' > "$ubuntu_sources"
+      ;;
     comment-only-sources)
       printf "# Archives moved to another sources file\n\n# No active stanza here\n" > "$ubuntu_sources"
       cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.expected"
@@ -2791,7 +2815,7 @@ MOCK
   [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
 
   case "$source_state" in
-    main-only|third-party-archive|mixed-archive-uris|custom-ubuntu-mirror|standard-ubuntu-archives|ubuntu-and-third-party-stanzas|universe-present|continued-fields|field-name-whitespace|leading-indented-preamble|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources)
+    main-only|third-party-archive|mixed-archive-uris|custom-ubuntu-mirror|standard-ubuntu-archives|archive-hostname-case|archive-path-case|ubuntu-and-third-party-stanzas|universe-present|continued-fields|field-name-whitespace|leading-indented-preamble|multiline-components|multiline-components-with-universe|flat-only|custom-path|mixed-flat-and-archive|disabled-stanza|disabled-numeric-zeros|duplicate-components|duplicate-continued-components|duplicate-components-final-universe|duplicate-enabled-last-disabled|duplicate-uris-last-valid|empty-sources|comment-only-sources|empty-types)
       assert_status 0 "$status"
       local expected_sources
       if [ -f "$sandbox_dir/ubuntu.sources.expected" ]; then
@@ -2808,7 +2832,7 @@ MOCK
       if [[ "$source_state" =~ ^(third-party-archive|mixed-archive-uris|custom-ubuntu-mirror)$ ]]; then
         cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail 'unverified archive sources changed'
       fi
-      if [[ "$source_state" =~ ^(empty-sources|comment-only-sources)$ ]]; then
+      if [[ "$source_state" =~ ^(empty-sources|comment-only-sources|empty-types|archive-path-case)$ ]]; then
         cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || fail "inactive sources changed"
       fi
       # Sources are repaired and validated before any guest apt use.
@@ -3320,6 +3344,8 @@ run_case 'OrbStack preserves enabled third-party archive' test_orbstack_enables_
 run_case 'OrbStack preserves ambiguous continued Ubuntu and third-party URIs' test_orbstack_enables_universe_in_existing_deb822_sources mixed-archive-uris
 run_case 'OrbStack preserves unrecognized Ubuntu mirror' test_orbstack_enables_universe_in_existing_deb822_sources custom-ubuntu-mirror
 run_case 'OrbStack enables universe for standard Ubuntu archive URIs' test_orbstack_enables_universe_in_existing_deb822_sources standard-ubuntu-archives
+run_case 'OrbStack compares verified Ubuntu archive hostnames without case' test_orbstack_enables_universe_in_existing_deb822_sources archive-hostname-case
+run_case 'OrbStack preserves case-sensitive Ubuntu archive paths and mixed URIs' test_orbstack_enables_universe_in_existing_deb822_sources archive-path-case
 run_case 'OrbStack changes only verified Ubuntu stanzas beside third-party archive' test_orbstack_enables_universe_in_existing_deb822_sources ubuntu-and-third-party-stanzas
 run_case 'OrbStack leaves deb822 source with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources universe-present
 run_case 'OrbStack rejects deb822 stanza without Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-components 'lacks Components'
@@ -3342,6 +3368,8 @@ run_case 'OrbStack validates stanza with negative Enabled value' test_orbstack_e
 run_case 'OrbStack validates stanza with partially numeric Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-0x 'lacks URIs'
 run_case 'OrbStack validates stanza with invalid octal Enabled value' test_orbstack_enables_universe_in_existing_deb822_sources enabled-token-08 'lacks URIs'
 run_case 'OrbStack retains empty existing sources byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources empty-sources
+run_case 'OrbStack preserves explicit empty Types as an inert stanza' test_orbstack_enables_universe_in_existing_deb822_sources empty-types
+run_case 'OrbStack rejects absent Types before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-types 'lacks Types'
 run_case 'OrbStack retains comment-only existing sources byte-identical' test_orbstack_enables_universe_in_existing_deb822_sources comment-only-sources
 run_case 'OrbStack adds universe to final duplicate Components only' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-components
 run_case 'OrbStack uses final continued duplicate Components' test_orbstack_enables_universe_in_existing_deb822_sources duplicate-continued-components
