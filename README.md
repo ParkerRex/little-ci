@@ -386,8 +386,10 @@ already installed. Before any guest apt command, it adds `universe` to an
 enabled archive-style stanza (one whose `Suites` take `Components`) in an
 existing `/etc/apt/sources.list.d/ubuntu.sources` only when every URI uses HTTP
 or HTTPS with `archive.ubuntu.com/ubuntu`, `security.ubuntu.com/ubuntu`, or
-`ports.ubuntu.com/ubuntu-ports` (an optional trailing `/` is accepted). Hostnames
-are compared without case; paths remain case-sensitive and URI text is preserved.
+`ports.ubuntu.com/ubuntu-ports` (an optional trailing `/` is accepted). Schemes
+and hostnames are compared without case; matching default ports (`80` for HTTP,
+`443` for HTTPS) and one terminal DNS root dot are ignored for comparison.
+Other ports remain unrecognized; paths remain case-sensitive and URI text is preserved.
 Third-party archives, unrecognized custom Ubuntu mirrors, and stanzas mixing
 verified and unrecognized URIs stay byte-identical. If a custom mirror lacks a
 required dependency, apt installation fails normally. The update preserves the

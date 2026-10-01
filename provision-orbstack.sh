@@ -216,7 +216,7 @@ add_universe_component() {
     # enabled stanzas need URIs that each contain ":" and Suites; exact-path
     # Suites (ending in /) must omit Components, other Suites require it, and
     # one stanza cannot mix the two.
-    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count, ubuntu_archive, archive_uri) {
+    function finish_stanza(   enabled, suites, uris, types, count, i, suite_count, exact_count, ubuntu_archive, archive_uri, archive_authority) {
       if (!in_stanza) return
       if (!("types" in fields)) reject("deb822 stanza at line " stanza_start " lacks Types")
       count = split(fields["types"], types, /[[:space:]]+/)
@@ -238,10 +238,15 @@ add_universe_component() {
             reject("deb822 stanza at line " stanza_start " has URI " q uris[i] q " without " q ":" q)
           # Every URI must name a known Ubuntu archive. Custom mirrors and
           # mixed Ubuntu/third-party stanzas retain their original components.
-          # Fold hostname case only for comparison, preserving the path and text.
+          # Normalize scheme/authority only for comparison; preserve path case and text.
           archive_uri = uris[i]
-          if (match(archive_uri, /^https?:\/\/[^\/]+/))
-            archive_uri = tolower(substr(archive_uri, 1, RLENGTH)) substr(archive_uri, RLENGTH + 1)
+          if (match(tolower(archive_uri), /^https?:\/\/[^\/]+/)) {
+            archive_authority = tolower(substr(archive_uri, 1, RLENGTH))
+            if (archive_authority ~ /^http:\/\//) sub(/:80$/, "", archive_authority)
+            else sub(/:443$/, "", archive_authority)
+            sub(/\.$/, "", archive_authority)
+            archive_uri = archive_authority substr(archive_uri, RLENGTH + 1)
+          }
           if (archive_uri !~ /^https?:\/\/((archive|security)\.ubuntu\.com\/ubuntu|ports\.ubuntu\.com\/ubuntu-ports)\/?$/)
             ubuntu_archive = 0
         }
