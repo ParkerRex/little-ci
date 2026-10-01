@@ -209,6 +209,17 @@ case "${1:-}" in
       *" id -u "*) printf '%s\n' "${MOCK_GUEST_UID:-1000}" ;;
       *" uname -m "*) printf 'aarch64\n' ;;
     esac
+    if [ "${MOCK_EXECUTE_GUEST_APT_SOURCES:-0}" = 1 ] && [ "$#" -eq 7 ] && [[ " $* " == *" -u root bash -s "* ]]; then
+      guest_script="$(cat)"
+      [ -z "${MOCK_ORBCTL_STDIN_LOG:-}" ] || printf '%s\n' "$guest_script" >> "$MOCK_ORBCTL_STDIN_LOG"
+      if [[ "$guest_script" == *ubuntu.sources* ]]; then
+        printf 'guest-script ubuntu.sources\n' >> "$MOCK_COMMAND_LOG"
+        /bin/bash -s <<< "$guest_script"
+        exit $?
+      fi
+      [[ "$guest_script" != *apt-get* ]] || printf 'guest-script apt-get (not executed)\n' >> "$MOCK_COMMAND_LOG"
+      exit "${MOCK_ORBCTL_STATUS:-0}"
+    fi
     if [ -n "${MOCK_ORBCTL_STDIN_LOG:-}" ] && [[ " $* " == *" bash -s "* ]]; then
       cat >> "$MOCK_ORBCTL_STDIN_LOG"
       printf '\n' >> "$MOCK_ORBCTL_STDIN_LOG"
@@ -2554,6 +2565,135 @@ CONFIG
   esac
 }
 
+write_main_only_ubuntu_sources() {
+  cat > "$1" <<'SOURCES'
+# Ubuntu sources have moved to /etc/apt/sources.list.d/ubuntu.sources
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports/
+Suites: noble noble-updates noble-backports
+Components: main
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports/
+Suites: noble-security
+Components: main restricted
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+}
+
+test_orbstack_enables_universe_in_existing_deb822_sources() {
+  local source_state="$1" expected_message="${2:-}"
+  new_sandbox
+  install_uname_mock arm64
+  install_orbctl_machine_mock
+  mkdir -p "$sandbox_dir/apt/sources.list.d"
+  : > "$sandbox_dir/apt/sources.list"
+  : > "$sandbox_dir/orbctl-stdin.log"
+  local ubuntu_sources="$sandbox_dir/apt/sources.list.d/ubuntu.sources"
+  local other_sources="$sandbox_dir/apt/sources.list.d/docker.sources"
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\n' > "$other_sources"
+  cp "$other_sources" "$sandbox_dir/docker.sources.before"
+
+  case "$source_state" in
+    main-only) write_main_only_ubuntu_sources "$ubuntu_sources" ;;
+    universe-present)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's/^Components: .*/Components: main restricted universe multiverse/' "$ubuntu_sources"
+      ;;
+    missing-components)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i '/^Components: main restricted$/d' "$ubuntu_sources"
+      ;;
+    multiline-components)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's/^Components: main restricted$/Components: main\n restricted/' "$ubuntu_sources"
+      ;;
+    not-regular) mkdir "$ubuntu_sources" ;;
+    continued-fields)
+      cat > "$ubuntu_sources" <<'SOURCES'
+Types: deb
+URIs:
+ http://ports.ubuntu.com/ubuntu-ports/
+Suites: noble
+ noble-updates
+# comment inside a stanza
+Components: main
+Signed-By:
+ /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+      ;;
+    orphan-continuation)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      printf '\n http://ports.ubuntu.com/ubuntu-ports/\nTypes: deb\n' >> "$ubuntu_sources"
+      ;;
+    empty-uris)
+      write_main_only_ubuntu_sources "$ubuntu_sources"
+      sed -i 's|^URIs: http://ports.ubuntu.com/ubuntu-ports/$|URIs:|' "$ubuntu_sources"
+      ;;
+  esac
+  [ -d "$ubuntu_sources" ] || cp "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before"
+
+  cat > "$sandbox_dir/bin/dpkg" <<'MOCK'
+#!/usr/bin/env bash
+[ "${1:-}" = --print-architecture ] && { printf 'arm64\n'; exit 0; }
+exit 64
+MOCK
+  cat > "$sandbox_dir/bin/apt-get" <<'MOCK'
+#!/usr/bin/env bash
+printf 'guest apt-get %s\n' "$*" >> "${MOCK_COMMAND_LOG:?}"
+MOCK
+  chmod +x "$sandbox_dir/bin/dpkg" "$sandbox_dir/bin/apt-get"
+
+  local output status
+  set +e
+  output="$(
+    cd "$sandbox_dir/repo" &&
+      PATH="$sandbox_dir/bin:$PATH" \
+      MOCK_COMMAND_LOG="$sandbox_dir/command.log" \
+      MOCK_ORBCTL_STDIN_LOG="$sandbox_dir/orbctl-stdin.log" \
+      MOCK_EXECUTE_GUEST_APT_SOURCES=1 \
+      LITTLE_CI_APT_SOURCES_DIR="$sandbox_dir/apt/sources.list.d" \
+      LITTLE_CI_APT_SOURCES_LIST="$sandbox_dir/apt/sources.list" \
+      MOCK_MACHINE_EXISTS=1 \
+      MOCK_MACHINE_NAME=little-ci-acme-widget-studio \
+      MOCK_ORB_INFO='{"record":{"name":"little-ci-acme-widget-studio","state":"running","image":{"distro":"ubuntu","version":"noble","arch":"arm64"},"config":{"isolated":true,"isolate_network":true,"forward_ssh_agent":false,"default_username":"deploy","cpu_limit":2,"memory_limit_mib":4096,"disk_limit_bytes":51539607552}}}' \
+      MOCK_ORB_IDENTITY=$'machine=little-ci-acme-widget-studio\nscope=repository\ntarget=acme/widget\nprefix=little-ci-acme-widget-studio\nuser=deploy\nhome=/home/deploy' \
+      GITHUB_SCOPE=repository \
+      GITHUB_URL=https://github.com/acme/widget \
+      FLEET_ID=studio \
+      ./provision-orbstack.sh 2>&1
+  )"
+  status=$?
+  set -e
+  cmp -s "$other_sources" "$sandbox_dir/docker.sources.before" || fail 'unrelated apt source was modified'
+  [ -z "$(find "$sandbox_dir/apt/sources.list.d" -name '.ubuntu.sources.*')" ] || fail 'temporary sources file left behind'
+
+  case "$source_state" in
+    main-only|universe-present|continued-fields)
+      assert_status 0 "$status"
+      local expected_sources
+      expected_sources="$(sed -e 's/^Components: main$/Components: main universe/' \
+        -e 's/^Components: main restricted$/Components: main restricted universe/' \
+        "$sandbox_dir/ubuntu.sources.before")"
+      [ "$(cat "$ubuntu_sources")" = "$expected_sources" ] || \
+        fail "ubuntu.sources not updated exactly: $(diff <(printf '%s\n' "$expected_sources") "$ubuntu_sources" | tr '\n' ' ')"
+      # Sources are repaired and validated before any guest apt use.
+      assert_file_order "$sandbox_dir/command.log" 'guest-script ubuntu.sources' 'guest-script apt-get'
+      assert_file_order "$sandbox_dir/command.log" 'guest-script ubuntu.sources' './provision-job-dependencies.sh'
+      ;;
+    *)
+      [ "$status" -ne 0 ] || fail "$source_state ubuntu.sources was accepted"
+      assert_contains "$output" "$expected_message"
+      assert_file_not_contains "$sandbox_dir/command.log" 'guest apt-get'
+      assert_file_not_contains "$sandbox_dir/command.log" 'guest-script apt-get'
+      assert_file_not_contains "$sandbox_dir/command.log" 'provision-job-dependencies.sh'
+      [ -d "$ubuntu_sources" ] || cmp -s "$ubuntu_sources" "$sandbox_dir/ubuntu.sources.before" || \
+        fail 'malformed ubuntu.sources was modified'
+      ;;
+  esac
+}
+
 test_orbstack_provisioning_installs_job_dependencies_in_guest() {
   new_sandbox
   install_uname_mock arm64
@@ -3042,6 +3182,14 @@ run_case 'job dependencies require root before apt' test_job_dependencies_reject
 run_case 'job dependencies fail on apt install failure' test_job_dependencies_fail_when_apt_or_verification_fails apt
 run_case 'job dependencies fail when packages remain missing' test_job_dependencies_fail_when_apt_or_verification_fails verification
 run_case 'job dependencies load owning config without changing packages' test_job_dependencies_load_owning_config_without_changing_packages
+run_case 'OrbStack enables universe in main-only deb822 source before dependencies' test_orbstack_enables_universe_in_existing_deb822_sources main-only
+run_case 'OrbStack leaves deb822 source with universe unchanged' test_orbstack_enables_universe_in_existing_deb822_sources universe-present
+run_case 'OrbStack rejects deb822 stanza without Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources missing-components 'lacks Components'
+run_case 'OrbStack rejects multi-line deb822 Components before apt' test_orbstack_enables_universe_in_existing_deb822_sources multiline-components 'multi-line Components'
+run_case 'OrbStack rejects non-regular ubuntu.sources before apt' test_orbstack_enables_universe_in_existing_deb822_sources not-regular 'is not a readable regular file'
+run_case 'OrbStack accepts continued deb822 URIs, Suites, and Signed-By' test_orbstack_enables_universe_in_existing_deb822_sources continued-fields
+run_case 'OrbStack rejects orphan deb822 continuation before apt' test_orbstack_enables_universe_in_existing_deb822_sources orphan-continuation 'malformed deb822 continuation'
+run_case 'OrbStack rejects empty deb822 URIs before apt' test_orbstack_enables_universe_in_existing_deb822_sources empty-uris 'lacks URIs'
 run_case 'OrbStack provisioning installs job dependencies in guest as root' test_orbstack_provisioning_installs_job_dependencies_in_guest
 run_case 'local uninstall unregisters and removes the selected runner' test_local_uninstall_uses_remove_token_and_deletes_selected_runner
 run_case 'local uninstall rejects RUNNER_HOME=/ before commands' test_local_uninstall_rejects_root_runner_home_before_commands

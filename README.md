@@ -382,7 +382,13 @@ provision, doctor, and health checks again.
 Re-run `provision-orbstack.sh` after changing compatible host configuration. A
 re-run also installs any CI job dependencies that a machine provisioned by an
 older Little-CI release is missing; it does not upgrade packages that are
-already installed.
+already installed. Before any guest apt command, it adds `universe` to any
+stanza in an existing `/etc/apt/sources.list.d/ubuntu.sources` that omits it,
+preserving that file's other lines and every other apt source. Indented
+continuation lines are accepted for every field except `Components`. An
+unreadable, non-regular, or malformed `ubuntu.sources` (for example, a stanza
+without `Types`, `URIs`, `Suites`, or a single-line `Components`) stops
+provisioning before apt runs.
 Resource settings are part of strict machine validation, so changing
 `ORB_CPUS`, `ORB_MEMORY`, or `ORB_DISK` requires changing the existing OrbStack
 machine settings to match before provisioning will continue.
